@@ -1,0 +1,21 @@
+pkgbase = libva-v4l2
+	pkgdesc = VA-API backend for Qualcomm Iris stateful V4L2 M2M decoding and H.264/HEVC encoding
+	pkgver = 1.0.0
+	pkgrel = 1
+	arch = aarch64
+	license = MIT
+	license = GPL-2.0-only
+	makedepends = meson
+	makedepends = ninja
+	depends = glibc
+	depends = gcc-libs
+	depends = libva
+	depends = libdrm
+	depends = mesa
+	depends = libglvnd
+	optdepends = qcom-fastcv-binaries: CDSP video scaling
+	optdepends = qcom-fastrpc: CDSP video scaling
+	source = libva-v4l2-1.0.0.tar.gz
+	sha256sums = 0aabfba1fbdb8515d7e64597ba4e6b2aee1d04caf30f992b1dabe460289adc94
+
+pkgname = libva-v4l2
