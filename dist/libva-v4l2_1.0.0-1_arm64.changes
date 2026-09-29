@@ -1,0 +1,31 @@
+Format: 1.8
+Date: Thu, 10 Sep 2026 17:03:16 +0800
+Source: libva-v4l2
+Binary: libva-v4l2
+Built-For-Profiles: derivative.ubuntu noudeb
+Architecture: arm64
+Version: 1.0.0-1
+Distribution: resolute
+Urgency: medium
+Maintainer: Xilin Wu <sophon@radxa.com>
+Changed-By: Xilin Wu <sophon@radxa.com>
+Description:
+ libva-v4l2 - VA-API backend for Qualcomm Iris stateful V4L2 devices
+Changes:
+ libva-v4l2 (1.0.0-1) unstable; urgency=medium
+ .
+   * Release 1.0.0.
+   * Build one ARM64 package on Noble for Trixie, Noble, and Resolute.
+   * Keep FastCV disabled and retain GStreamer VA session configuration.
+Checksums-Sha1:
+ 2e235c683d4bcf541c4adb001ebbd4f4cde389ee 1208982 libva-v4l2-dbgsym_1.0.0-1_arm64.ddeb
+ 3bbfe76c6af26c036df317987d717ed521d7556e 9923 libva-v4l2_1.0.0-1_arm64.buildinfo
+ 6c7cec61cf140fd21ea9952d42455b5a79ccad54 111648 libva-v4l2_1.0.0-1_arm64.deb
+Checksums-Sha256:
+ d159587b69d381a3f233bbb7d6a50185a3f137e91a739776da91a6279424ec7b 1208982 libva-v4l2-dbgsym_1.0.0-1_arm64.ddeb
+ 522b1de30c8bcb36351d64e80f6db2c0c848eaa539c81290be723378089c377a 9923 libva-v4l2_1.0.0-1_arm64.buildinfo
+ 4534fef66ed5498627890aa50b6c0639425377e2fd80a1f144155709ce8544ef 111648 libva-v4l2_1.0.0-1_arm64.deb
+Files:
+ 2f79641ea20ad2e4263be8d52f48f8df 1208982 debug optional libva-v4l2-dbgsym_1.0.0-1_arm64.ddeb
+ 5db9e7288f1e036f2073124f007aa43e 9923 video optional libva-v4l2_1.0.0-1_arm64.buildinfo
+ 05bf8f23d4f8cf7d3485fe74cd045b67 111648 video optional libva-v4l2_1.0.0-1_arm64.deb
