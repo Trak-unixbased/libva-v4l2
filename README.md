@@ -1,5 +1,261 @@
 # libva-v4l2
 
+**libva-v4l2** est un pilote d'arrière-plan (*backend driver*) pour l'API **VA-API** (Video Acceleration API) sous Linux. 
+
+Il permet d'assurer l'interface entre l'API VA-API (utilisée par les lecteurs vidéo et navigateurs web) et l'API noyau Linux **V4L2 Memory-to-Memory (M2M) Stateless / Request API**, exploitée par les accélérateurs matériels (VPU) de nombreux processeurs embarqués (SoC).
+
+---
+
+## Sommaire
+
+- [À quoi sert ce projet ?](#à-quoi-sert-ce-projet-)
+- [Architecture & Fonctionnement](#architecture--fonctionnement)
+- [Codecs et Plateformes pris en charge](#codecs-et-plateformes-pris-en-charge)
+- [Prérequis](#prérequis)
+  - [Matériel et Noyau](#matériel-et-noyau)
+  - [Dépendances logicielles](#dépendances-logicielles)
+- [Compilation et Installation](#compilation-et-installation)
+  - [1. Cloner le dépôt](#1-cloner-le-dépôt)
+  - [2. Configurer et compiler avec Meson](#2-configurer-et-compiler-avec-meson)
+  - [3. Installer la bibliothèque](#3-installer-la-bibliothèque)
+- [Configuration et Variables d'environnement](#configuration-et-variables-denvironnement)
+  - [Déclaration du pilote VA-API](#déclaration-du-pilote-va-api)
+  - [Sélection explicite des périphériques V4L2](#sélection-explicite-des-périphériques-v4l2)
+  - [Compatibilité GStreamer](#compatibilité-gstreamer)
+- [Validation et Mise en œuvre](#validation-et-mise-en-œuvre)
+  - [Vérification avec vainfo](#vérification-avec-vainfo)
+  - [Test de décodage avec FFmpeg / MPV](#test-de-décodage-avec-ffmpeg--mpv)
+- [Dépannage fréquent](#dépannage-fréquent)
+- [Licence et Origines](#licence-et-origines)
+
+---
+
+## À quoi sert ce projet ?
+
+Sur de nombreuses cartes de développement et ordinateurs monocartes (SBCs basés sur Rockchip, Allwinner, NXP, etc.), le décodage vidéo matériel (VPU) est piloté dans le noyau Linux via les sous-systèmes **Video4Linux2 (V4L2)** et l'API **Request/M2M Stateless**.
+
+Cependant, la plupart des applications multimédias de bureau (VLC, MPV, Chromium, Firefox, Kodi, GStreamer) n'implémentent pas directement l'API V4L2 Stateless et s'appuient plutôt sur des standards de plus haut niveau comme **VA-API**.
+
+**libva-v4l2** sert de passerelle d'abstraction :
+- Il expose une interface standard VA-API (`v4l2_drv_video.so`).
+- Il traduit les ordres de décodage VA-API en commandes V4L2 Stateless / Request API pour le pilote noyau du SoC.
+- Il décharge le processeur principal (CPU) en confiant le décodage vidéo lourd au VPU matériel.
+
+---
+
+## Architecture & Fonctionnement
+
+```text
++-------------------------------------------------------+
+|  Applications multimédias (MPV, VLC, FFmpeg, GStreamer)|
++-------------------------------------------------------+
+                           |
+                           v
+               [ VA-API (libva.so) ]
+                           |
+                           v
+          [ libva-v4l2 (v4l2_drv_video.so) ]
+                           |
+          (V4L2 M2M Request API / IOCTLs)
+                           |
+                           v
++-------------------------------------------------------+
+| Noyau Linux : Pilotes V4L2 (Hantro, Cedrus, RKVDEC)    |
+| Périphériques : /dev/videoX et /dev/mediaY            |
++-------------------------------------------------------+
+                           |
+                           v
+        [ VPU Matériel du Processeur / SoC ]
+```
+
+---
+
+## Codecs et Plateformes pris en charge
+
+### Codecs
+Selon la maturité du pilote noyau et du matériel cible, le backend prend en charge ou vise :
+- **MPEG-2** (Simple / Main profile)
+- **H.264 / AVC** (Baseline, Main, High profiles)
+- **VP8**
+- **VP9** (partiel ou selon version)
+- **H.265 / HEVC** (sur les versions dérivées de *libva-v4l2-request*)
+
+### Plateformes matérielles courantes
+- **Rockchip** (RK3399, RK3328, RK3566, RK3588 avec pilotes *hantro* ou *rkvdec*).
+- **Allwinner** (A64, H3, H5, H6 via le pilote noyau *cedrus*).
+- **NXP i.MX** (i.MX8MQ avec pilote *hantro*).
+
+---
+
+## Prérequis
+
+### Matériel et Noyau
+1. Un SoC Linux doté d'un décodeur VPU géré par un pilote mainline V4L2.
+2. Un noyau Linux récent (idéalement $\ge$ 5.10) compilé avec le support des APIs multimédia :
+   - `CONFIG_MEDIA_SUPPORT=y`
+   - `CONFIG_MEDIA_CONTROLLER=y`
+   - `CONFIG_VIDEO_DEV=y`
+   - `CONFIG_V4L2_MEM2MEM_DEV=y`
+3. Présence des nœuds `/dev/media*` et `/dev/video*` accessibles en lecture/écriture par votre utilisateur (appartenance au groupe `video`).
+
+### Dépendances logicielles
+
+Sous Debian / Ubuntu / Armbian :
+```bash
+sudo apt update
+sudo apt install -y \
+    build-essential \
+    meson \
+    ninja-build \
+    pkg-config \
+    libva-dev \
+    libdrm-dev \
+    vainfo \
+    v4l-utils
+```
+
+Sous Arch Linux ARM / Manjaro ARM :
+```bash
+sudo pacman -Syu --needed \
+    base-devel \
+    meson \
+    ninja \
+    pkgconf \
+    libva \
+    libdrm \
+    libva-utils \
+    v4l-utils
+```
+
+---
+
+## Compilation et Installation
+
+### 1. Cloner le dépôt
+
+```bash
+git clone https://github.com/Trak-unixbased/libva-v4l2.git
+cd libva-v4l2
+```
+
+### 2. Configurer et compiler avec Meson
+
+```bash
+# Configuration du répertoire de compilation
+meson setup build --prefix=/usr
+
+# Compilation du pilote
+meson compile -C build
+```
+
+### 3. Installer la bibliothèque
+
+```bash
+sudo meson install -C build
+```
+
+Le pilote compilé (généralement `v4l2_drv_video.so`) sera copié dans le répertoire officiel des pilotes VA-API (par exemple `/usr/lib/dri/` ou `/usr/lib/aarch64-linux-gnu/dri/`).
+
+---
+
+## Configuration et Variables d'environnement
+
+### Déclaration du pilote VA-API
+
+Pour forcer `libva` à employer ce backend :
+
+```bash
+# Indiquer le nom du pilote
+export LIBVA_DRIVER_NAME=v4l2
+
+# Si vous testez directement depuis le dossier build sans installer :
+export LIBVA_DRIVERS_PATH="$(pwd)/build/src"
+```
+
+### Sélection explicite des périphériques V4L2
+
+Par défaut, le pilote sonde le système pour identifier les décodeurs compatibles. Si plusieurs cartes vidéo ou média existent (ex: une webcam USB + le VPU interne), forcez les périphériques cibles :
+
+```bash
+# Identifier les contrôleurs médias disponibles
+v4l2-ctl --list-devices
+
+# Définir explicitement les chemins
+export LIBVA_V4L2_VIDEO_PATH=/dev/video0
+export LIBVA_V4L2_MEDIA_PATH=/dev/media0
+```
+
+### Compatibilité GStreamer
+
+GStreamer utilise une liste blanche de pilotes autorisés pour VA-API. Activez le pilote V4L2 avec :
+
+```bash
+export GST_VAAPI_ALL_DRIVERS=1
+```
+
+---
+
+## Validation et Mise en œuvre
+
+### Vérification avec vainfo
+
+Lancez la commande suivante pour contrôler que le pilote se charge et liste les profils matériels :
+
+```bash
+LIBVA_DRIVER_NAME=v4l2 vainfo
+```
+
+**Sortie attendue (exemple) :**
+```text
+vainfo: VA-API version: 1.x
+vainfo: Driver version: v4l2 backend
+vainfo: Supported profile and entrypoints
+      VAProfileMPEG2Simple            : VAEntrypointVLD
+      VAProfileMPEG2Main              : VAEntrypointVLD
+      VAProfileH264ConstrainedBaseline: VAEntrypointVLD
+      VAProfileH264Main               : VAEntrypointVLD
+      VAProfileH264High               : VAEntrypointVLD
+```
+
+### Test de décodage avec FFmpeg / MPV
+
+#### Avec MPV :
+```bash
+LIBVA_DRIVER_NAME=v4l2 mpv --hwdec=vaapi --vo=gpu video_test_h264.mp4
+```
+
+#### Avec FFmpeg :
+```bash
+LIBVA_DRIVER_NAME=v4l2 ffmpeg -hwaccel vaapi -hwaccel_device /dev/dri/renderD128 \
+    -i video_test_h264.mp4 -f null -
+```
+
+---
+
+## Dépannage fréquent
+
+1. **`vaGetDriverName() returns -1` ou pilote non trouvé :**
+   - Vérifiez l'emplacement de `v4l2_drv_video.so`. Définissez `LIBVA_DRIVERS_PATH` vers son dossier d'installation.
+2. **Permissions refusées (`Permission denied`) sur `/dev/video*` :**
+   - Ajoutez votre utilisateur au groupe `video` :
+     ```bash
+     sudo usermod -aG video $USER
+     ```
+   - Déconnectez-vous puis reconnectez-vous.
+3. **Échec d'allocation mémoire / DMABUF :**
+   - Certains VPU nécessitent une réserve de mémoire contiguë (CMA - Contiguous Memory Allocator). Augmentez la taille CMA dans la ligne de commande du noyau (`/boot/cmdline.txt` ou `armbianEnv.txt`), par exemple :
+     ```text
+     cma=256M
+     ```
+
+---
+
+## Licence et Origines
+
+- Ce projet dérive des travaux initiaux de **Bootlin** (`libva-v4l2-request`) et des continuations communautaires (`mxsrc/libva-v4l2`).
+- Distribué principalement sous licence **LGPL-2.1** (consultez le fichier `COPYING` ou `LICENSE` pour les conditions exactes).
+# libva-v4l2
+
 A VA-API backend for Qualcomm Iris, using the Linux V4L2 stateful M2M interface.
 It provides hardware video decoding and H.264/HEVC encoding on **SC8280XP**, tested on
 **Radxa Dragon Q8B**. The project is experimental and targets this platform;
