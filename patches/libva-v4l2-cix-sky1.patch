@@ -1,0 +1,2029 @@
+diff --git a/.github/workflows/debian.yml b/.github/workflows/debian.yml
+index 73f812b..f60efbb 100644
+--- a/.github/workflows/debian.yml
++++ b/.github/workflows/debian.yml
+@@ -74,6 +74,7 @@ jobs:
+         run: |
+           apt-get install -y ./artifacts/libva-v4l2_*.deb
+           test "$(readlink /usr/lib/aarch64-linux-gnu/dri/msm_drv_video.so)" = v4l2_drv_video.so
++          test "$(readlink /usr/lib/aarch64-linux-gnu/dri/panthor_drv_video.so)" = v4l2_drv_video.so
+           cmp packaging/environment/60-libva-v4l2.conf /usr/lib/environment.d/60-libva-v4l2.conf
+           cmp packaging/environment/libva-v4l2.sh /etc/profile.d/libva-v4l2.sh
+           python3 - <<'PYTHON'
+diff --git a/README.md b/README.md
+index 3744d98..38adfa6 100644
+--- a/README.md
++++ b/README.md
+@@ -1,9 +1,14 @@
+ # libva-v4l2
+ 
+-A VA-API backend for Qualcomm Iris, using the Linux V4L2 stateful M2M interface.
+-It provides hardware video decoding and H.264/HEVC encoding on **SC8280XP**, tested on
+-**Radxa Dragon Q8B**. The project is experimental and targets this platform;
+-it is not a generic backend for all V4L2 devices.
++A VA-API backend for V4L2 stateful M2M codecs. It provides hardware video decoding and
++H.264/HEVC encoding on:
++
++- **Qualcomm SC8280XP** (Iris), tested on **Radxa Dragon Q8B**;
++- **CIX CD8180 / Sky1** (Arm Linlon MVE v8, V4L2 driver `mvx`, Mali-G720 through
++  Panthor), targeting **Orange Pi 6 Plus** with Ubuntu 26.04 and a Sky1 Linux 7.x kernel.
++
++The project is experimental and targets these platforms; it is not a generic backend for
++all V4L2 devices.
+ 
+ ## Support
+ 
+@@ -50,11 +55,14 @@ and pipeline configuration.
+ 
+ ## Requirements
+ 
+-- Linux with the Qualcomm Iris stateful driver and MSM DRM support.
+-- The changes supplied in [patches/](patches/), unless already present in your
+-  kernel: decode-order output, larger CAPTURE pools, and encoder deblocking
+-  controls. The patches are references to integrate into your kernel.
+-- Access to the Iris video devices and DRM render node.
++- Qualcomm: Linux with the Iris stateful driver and MSM DRM support, plus the changes
++  supplied in [patches/](patches/), unless already present in your kernel: decode-order
++  output, larger CAPTURE pools, and encoder deblocking controls. The patches are
++  references to integrate into your kernel.
++- CIX Sky1 (Orange Pi 6 Plus): a kernel with the Sky1 patches (Panthor GPU support),
++  the Linlon VPU module (`amvx`, e.g. from `sky1-drivers-dkms`) with its firmware, and
++  Mesa ≥ 25.1 (Panfrost/Panthor). No kernel patch from [patches/](patches/) is needed.
++- Access to the video devices and the DRM render node (`video` and `render` groups).
+ - A C++17 compiler, Meson ≥ 0.61, Ninja, pkg-config, and development libraries
+   for libva, libdrm, EGL, GLES 3.2, and GBM.
+ - For VPP: system FastCV and FastRPC libraries with a working CDSP runtime.
+@@ -92,9 +100,10 @@ when dependencies are available or `-Dfastcv=enabled` to require build dependenc
+ Debian / Ubuntu packages explicitly disable FastCV for consistent distribution builds.
+ FastCV is loaded dynamically; missing runtime libraries disable only VPP.
+ 
+-Adjust `libdir` if your system uses a driver directory other than `/usr/lib/dri`.
+-Installation adds the MSM driver alias, so **`LIBVA_DRIVER_NAME` is not required**
+-on the target platform.
++Adjust `libdir` if your system uses a driver directory other than `/usr/lib/dri`
++(Debian/Ubuntu on ARM64: `-Dlibdir=lib/aarch64-linux-gnu`).
++Installation adds the `msm` and `panthor` driver aliases, so **`LIBVA_DRIVER_NAME` is not
++required** on the target platforms.
+ 
+ To check the installation (`vainfo` comes from `libva-utils` on Arch):
+ 
+@@ -161,10 +170,35 @@ while H.264 remains available.
+ | --- | --- |
+ | `LIBVA_DRIVER_NAME=v4l2` | Explicitly select this backend. |
+ | `LIBVA_DRIVERS_PATH=/path/to/build` | Load an uninstalled build. |
+-| `IRIS_VAAPI_DEVICE` / `IRIS_VAAPI_ENCODER_DEVICE` | Override automatic video-device discovery. |
++| `LIBVA_V4L2_DECODER_DEVICE` / `LIBVA_V4L2_ENCODER_DEVICE` | Override automatic video-device discovery (also `IRIS_VAAPI_DEVICE` / `IRIS_VAAPI_ENCODER_DEVICE`). |
+ | `IRIS_VAAPI_COPY=gpu` or `cpu` | Select the copy path; default is `gpu`. |
+ | `IRIS_VAAPI_DEBUG=1` | Enable diagnostics. |
+ 
++### CIX Sky1 / Orange Pi 6 Plus notes
++
++- Discovery uses the Linlon nodes named `mvxdec` / `mvxenc` and does not open other video
++  nodes (the vendor ISP node is known to misbehave when probed).
++- Decoding requests decode-order output through the Linlon `frame reordering` control and
++  marks each compressed frame as complete, so every VA picture finishes on its own.
++- Linlon reports NV12/P010 as two V4L2 planes. Decoded surfaces are exported as two-object
++  DRM PRIME descriptors with 128-byte pitches; `vaDeriveImage` maps both planes into one
++  range. `vaAcquireBufferHandle` is unavailable for these surfaces.
++- Surfaces which are not decoder output are allocated from `/dev/dma_heap/system` when
++  accessible, then `/dev/udmabuf`, then a linear GBM buffer on the Panthor render node.
++- The GPU copy uses GLES 3.1 (Panfrost) with `EXT_copy_image` or a framebuffer blit.
++- Encoding copies NV12 input into the VPU queue on the CPU. Parameter sets, which the
++  Linlon firmware emits once as a separate buffer, are merged into the first picture and
++  repeated before every forced keyframe. B frames remain unsupported.
++
++Quick check on the board:
++
++```sh
++v4l2-ctl --list-devices          # expect mvxdec and mvxenc
++vainfo --display drm --device /dev/dri/renderD128
++IRIS_VAAPI_DEBUG=1 ffmpeg -hwaccel vaapi -hwaccel_device /dev/dri/renderD128 \
++  -i input.mp4 -f null -
++```
++
+ Use clang-format 22 and the checked-in `.clang-format`. Meson provides `format`
+ and `format-check` targets when clang-format is available; `-Dwerror=true`
+ enables compiler warnings as errors. Hardware tests and their run instructions
+diff --git a/debian/control b/debian/control
+index 5d7a09f..c8e2d78 100644
+--- a/debian/control
++++ b/debian/control
+@@ -14,10 +14,12 @@ Package: libva-v4l2
+ Architecture: arm64
+ Depends: ${shlibs:Depends}, ${misc:Depends}
+ Provides: va-driver
+-Description: VA-API backend for Qualcomm Iris stateful V4L2 devices
+- Hardware video decoding and H.264/HEVC encoding through the Qualcomm Iris
+- stateful V4L2 M2M interface. This experimental driver targets SC8280XP,
+- including Radxa Dragon Q8B, and requires a compatible kernel and firmware.
++Description: VA-API backend for V4L2 stateful codecs (Qualcomm Iris, Arm Linlon)
++ Hardware video decoding and H.264/HEVC encoding through the V4L2 stateful M2M
++ interface. This experimental driver targets Qualcomm SC8280XP (Iris),
++ including Radxa Dragon Q8B, and CIX CD8180/Sky1 (Arm Linlon "mvx" with a
++ Panthor GPU), including Orange Pi 6 Plus. It requires a compatible kernel
++ and firmware.
+  .
+- Includes the MSM driver alias and GStreamer VA environment configuration.
+- FastCV video processing is disabled in distribution builds.
++ Includes the MSM and Panthor driver aliases and GStreamer VA environment
++ configuration. FastCV video processing is disabled in distribution builds.
+diff --git a/meson.build b/meson.build
+index 672da4a..0752234 100644
+--- a/meson.build
++++ b/meson.build
+@@ -48,6 +48,7 @@ endif
+ summary('FastCV CDSP VPP', have_fastcv)
+ 
+ sources = files(
++  'src/allocator.cpp',
+   'src/backend.cpp',
+   'src/decoder.cpp',
+   'src/encoder.cpp',
+@@ -71,13 +72,16 @@ shared_library(
+   install_dir: driver_install_dir,
+ )
+ 
+-# libva falls back to the DRM driver name on Qualcomm MSM devices.
+-install_symlink(
+-  'msm_drv_video.so',
+-  pointing_to: 'v4l2_drv_video.so',
+-  install_dir: driver_install_dir,
+-  install_tag: 'runtime',
+-)
++# libva falls back to the DRM driver name of the VA display: msm on Qualcomm,
++# panthor for the Mali-G720 render node of CIX Sky1 (Orange Pi 6 Plus).
++foreach alias : ['msm', 'panthor']
++  install_symlink(
++    alias + '_drv_video.so',
++    pointing_to: 'v4l2_drv_video.so',
++    install_dir: driver_install_dir,
++    install_tag: 'runtime',
++  )
++endforeach
+ 
+ install_data('README.md', install_dir: get_option('datadir') / 'doc' / meson.project_name())
+ install_data('LICENSE', install_dir: get_option('datadir') / 'licenses' / meson.project_name())
+diff --git a/src/allocator.cpp b/src/allocator.cpp
+new file mode 100644
+index 0000000..37cb135
+--- /dev/null
++++ b/src/allocator.cpp
+@@ -0,0 +1,172 @@
++// SPDX-License-Identifier: MIT
++#include "internal.hpp"
++#include <gbm.h>
++#include <linux/dma-heap.h>
++#include <linux/udmabuf.h>
++#include <sys/ioctl.h>
++#include <sys/mman.h>
++#include <fcntl.h>
++#include <unistd.h>
++#include <xf86drm.h>
++#include <cerrno>
++
++namespace irisva {
++namespace {
++size_t page_align(size_t size) {
++    long page = sysconf(_SC_PAGESIZE);
++    check(page > 0, "cannot determine page size");
++    return (size + size_t(page) - 1) / size_t(page) * size_t(page);
++}
++int retry_ioctl(int fd, unsigned long command, void *argument) {
++    int result;
++    do {
++        result = ioctl(fd, command, argument);
++    } while (result < 0 && errno == EINTR);
++    return result;
++}
++// The system heap provides cached pages with DMA-BUF CPU access maintenance.
++// Distributions usually restrict /dev/dma_heap to root; failure is expected.
++int dma_heap_allocate(size_t size) {
++    int heap = open("/dev/dma_heap/system", O_RDONLY | O_CLOEXEC);
++    if (heap < 0)
++        return -1;
++    dma_heap_allocation_data data{};
++    data.len = size;
++    data.fd_flags = O_RDWR | O_CLOEXEC;
++    int result = retry_ioctl(heap, DMA_HEAP_IOCTL_ALLOC, &data);
++    close(heap);
++    return result == 0 ? int(data.fd) : -1;
++}
++// systemd grants /dev/udmabuf to the seat user. The kernel limits a single
++// buffer (udmabuf.size_limit_mb, 64 MiB by default); larger requests fail.
++int udmabuf_allocate(size_t size) {
++    int device = open("/dev/udmabuf", O_RDWR | O_CLOEXEC);
++    if (device < 0)
++        return -1;
++    int fd = -1;
++    int memfd = memfd_create("libva-v4l2", MFD_CLOEXEC | MFD_ALLOW_SEALING);
++    if (memfd >= 0 && ftruncate(memfd, off_t(size)) == 0 &&
++        fcntl(memfd, F_ADD_SEALS, F_SEAL_SHRINK) == 0) {
++        udmabuf_create create{};
++        create.memfd = memfd;
++        create.flags = UDMABUF_FLAGS_CLOEXEC;
++        create.offset = 0;
++        create.size = size;
++        fd = retry_ioctl(device, UDMABUF_CREATE, &create);
++    }
++    if (memfd >= 0)
++        close(memfd);
++    close(device);
++    return fd;
++}
++} // namespace
++
++struct Allocator::Gbm {
++    int fd = -1;
++    gbm_device *device = nullptr;
++    explicit Gbm(int render_fd) {
++        // A private file description keeps GBM's GEM handles out of the
++        // application's handle namespace. Sandboxed callers may only own the
++        // VA fd; a duplicate is still correct because handles are closed
++        // before the PRIME fd is returned.
++        if (char *name = drmGetRenderDeviceNameFromFd(render_fd)) {
++            fd = open(name, O_RDWR | O_CLOEXEC);
++            free(name);
++        }
++        if (fd < 0)
++            fd = fcntl(render_fd, F_DUPFD_CLOEXEC, 0);
++        check(fd >= 0, "open render node for GBM allocation", VA_STATUS_ERROR_ALLOCATION_FAILED);
++        device = gbm_create_device(fd);
++        if (!device) {
++            close(fd);
++            throw Error(VA_STATUS_ERROR_ALLOCATION_FAILED, "create GBM allocation device");
++        }
++    }
++    ~Gbm() {
++        gbm_device_destroy(device);
++        close(fd);
++    }
++    Gbm(const Gbm &) = delete;
++    Gbm &operator=(const Gbm &) = delete;
++    // Allocates rows of at least stride bytes; returns the PRIME fd and the
++    // stride chosen by the GPU driver.
++    int allocate(unsigned stride, unsigned rows, unsigned &actual_stride) {
++        // ABGR8888 texels transport raw bytes; no YUV semantics are needed.
++        gbm_bo *bo = gbm_bo_create(device, stride / 4, rows, GBM_FORMAT_ABGR8888,
++                                   GBM_BO_USE_LINEAR | GBM_BO_USE_RENDERING);
++        if (!bo)
++            return -1;
++        actual_stride = gbm_bo_get_stride(bo);
++        int prime = -1;
++        // Export read/write ourselves: some Mesa drivers export read-only fds,
++        // which cannot be mapped writable for vaPutImage or encoder upload.
++        if (gbm_bo_get_offset(bo, 0) != 0 || actual_stride < stride ||
++            drmPrimeHandleToFD(fd, gbm_bo_get_handle(bo).u32, DRM_CLOEXEC | DRM_RDWR, &prime) < 0)
++            prime = -1;
++        gbm_bo_destroy(bo); // The PRIME fd owns the storage.
++        return prime;
++    }
++};
++
++Allocator::Allocator(int render_fd)
++    : render_fd_(render_fd), msm_(render_fd >= 0 && irisva_drm_is_msm(render_fd)) {}
++Allocator::~Allocator() = default;
++
++std::shared_ptr<Memory> Allocator::allocate(unsigned width, unsigned height, unsigned fourcc) {
++    check(width && height && width <= 8192 && height <= 8192, "invalid surface allocation size",
++          VA_STATUS_ERROR_ALLOCATION_FAILED);
++    auto m = std::make_shared<Memory>();
++    m->width = width;
++    m->height = height;
++    m->fourcc = fourcc;
++    unsigned bytes_per_sample = fourcc == VA_FOURCC_P010 ? 2 : 1;
++    // 128-byte pitches satisfy Iris, Linlon and Mali (64-byte) import rules.
++    m->stride = (width * bytes_per_sample + 127) & ~127u;
++    m->storage_height = (height + 31) & ~31u;
++    const unsigned rows = m->storage_height + m->storage_height / 2;
++    m->size = page_align(size_t(m->stride) * rows);
++    const char *kind = "msm";
++    if (msm_) {
++        // Keep the original Qualcomm path: coherent MSM GEM where available.
++        int coherent = 0;
++        m->fd = irisva_msm_allocate(render_fd_, m->size, &coherent);
++        m->origin = coherent ? MemoryOrigin::MsmCoherent : MemoryOrigin::MsmWriteCombined;
++    } else if ((m->fd = dma_heap_allocate(m->size)) >= 0) {
++        m->origin = MemoryOrigin::DmaHeap;
++        kind = "dma-heap";
++    } else if ((m->fd = udmabuf_allocate(m->size)) >= 0) {
++        m->origin = MemoryOrigin::Udmabuf;
++        kind = "udmabuf";
++    } else {
++        check(render_fd_ >= 0, "surface allocation requires a DRM display",
++              VA_STATUS_ERROR_ALLOCATION_FAILED);
++        if (!gbm_ && !gbm_failed_) {
++            try {
++                gbm_ = std::make_unique<Gbm>(render_fd_);
++            } catch (const Error &) {
++                gbm_failed_ = true;
++                throw;
++            }
++        }
++        check(bool(gbm_), "no usable DMA-BUF allocator (dma-heap, udmabuf or GBM)",
++              VA_STATUS_ERROR_ALLOCATION_FAILED);
++        unsigned stride = m->stride;
++        m->fd = gbm_->allocate(m->stride, rows, stride);
++        check(m->fd >= 0, "allocate linear GBM surface", VA_STATUS_ERROR_ALLOCATION_FAILED);
++        auto length = lseek(m->fd, 0, SEEK_END);
++        if (length < 0 || uint64_t(length) < uint64_t(stride) * rows) {
++            close(m->fd);
++            m->fd = -1;
++            throw Error(VA_STATUS_ERROR_ALLOCATION_FAILED, "GBM surface smaller than requested");
++        }
++        m->stride = stride;
++        m->size = size_t(length);
++        m->origin = MemoryOrigin::Gbm;
++        kind = "gbm";
++    }
++    check(m->fd >= 0, "allocate surface DMA-BUF", VA_STATUS_ERROR_ALLOCATION_FAILED);
++    trace("allocated %s surface %ux%u fourcc=%#x pitch=%u size=%zu", kind, width, height, fourcc,
++          m->stride, m->size);
++    return m;
++}
++} // namespace irisva
+diff --git a/src/backend.cpp b/src/backend.cpp
+index 0dec510..e8f2a55 100644
+--- a/src/backend.cpp
++++ b/src/backend.cpp
+@@ -13,8 +13,7 @@ Buffer::~Buffer() {
+         --parent->acquired_handles;
+     }
+     if (mapped) {
+-        dma_buf_sync sync{DMA_BUF_SYNC_END | DMA_BUF_SYNC_RW};
+-        ioctl(memory->fd, DMA_BUF_IOCTL_SYNC, &sync);
++        memory->sync(DMA_BUF_SYNC_END | DMA_BUF_SYNC_RW);
+         --parent->mapped_images;
+     }
+     if (memory)
+@@ -31,8 +30,7 @@ uint8_t *Buffer::map() {
+     check(!parent->acquired_handles, "surface handle acquired", VA_STATUS_ERROR_SURFACE_BUSY);
+     auto pointer = memory->map();
+     if (!mapped) {
+-        dma_buf_sync sync{DMA_BUF_SYNC_START | DMA_BUF_SYNC_RW};
+-        check(ioctl(memory->fd, DMA_BUF_IOCTL_SYNC, &sync) == 0,
++        check(memory->sync(DMA_BUF_SYNC_START | DMA_BUF_SYNC_RW),
+               "DMA-BUF map synchronization failed");
+         mapped = true;
+         ++parent->mapped_images;
+@@ -43,9 +41,7 @@ void Buffer::unmap() {
+     coded_mapped = false;
+     if (!mapped)
+         return;
+-    dma_buf_sync sync{DMA_BUF_SYNC_END | DMA_BUF_SYNC_RW};
+-    check(ioctl(memory->fd, DMA_BUF_IOCTL_SYNC, &sync) == 0,
+-          "DMA-BUF unmap synchronization failed");
++    check(memory->sync(DMA_BUF_SYNC_END | DMA_BUF_SYNC_RW), "DMA-BUF unmap synchronization failed");
+     mapped = false;
+     --parent->mapped_images;
+ }
+@@ -231,32 +227,18 @@ static VAImage create_image(Driver &d, unsigned fourcc, unsigned w, unsigned h)
+     return image;
+ }
+ 
+-static std::shared_ptr<Memory> allocate_undecoded_surface(VADriverContextP ctx, const Surface &s) {
++static std::shared_ptr<Memory> allocate_undecoded_surface(VADriverContextP ctx, Driver &d,
++                                                          const Surface &s) {
+     // mpv probes GPU import before creating a decoder context. Use an actual
+-    // linear MSM GEM allocation for these otherwise unbacked VA surfaces.
+-    // The PRIME fd owns the storage after the temporary GEM handle is closed.
++    // linear allocation for these otherwise unbacked VA surfaces: MSM GEM on
++    // Qualcomm, otherwise DMA heap, udmabuf or GBM (Panthor on CIX Sky1).
++    // The PRIME fd owns the storage after any temporary GEM handle is closed.
+     // If exported before decode, keep this allocation for the surface's
+     // lifetime. A consumer may keep its fd without calling export again.
+     check(ctx->drm_state, "surface allocation requires a DRM display");
+-    int fd = static_cast<drm_state *>(ctx->drm_state)->fd;
+-    auto m = std::make_shared<Memory>();
+-    m->width = s.width;
+-    m->height = s.height;
+-    m->fourcc = s.fourcc;
+-    unsigned bytes_per_sample = s.fourcc == VA_FOURCC_P010 ? 2 : 1;
+-    m->stride = (s.width * bytes_per_sample + 127) & ~127u;
+-    m->storage_height = (s.height + 31) & ~31u;
+-    long page_size = sysconf(_SC_PAGESIZE);
+-    check(page_size > 0, "cannot determine page size");
+-    size_t size = size_t(m->stride) * m->storage_height * 3 / 2;
+-    m->size = (size + size_t(page_size) - 1) / size_t(page_size) * size_t(page_size);
+-    int coherent = 0;
+-    m->fd = irisva_msm_allocate(fd, m->size, &coherent);
+-    m->origin = coherent ? MemoryOrigin::MsmCoherent : MemoryOrigin::MsmWriteCombined;
+-    check(m->fd >= 0, "allocate/export undecoded MSM surface", VA_STATUS_ERROR_ALLOCATION_FAILED);
+-    trace("allocated undecoded surface %ux%u fourcc=%#x pitch=%u size=%zu coherent=%d", s.width,
+-          s.height, s.fourcc, m->stride, m->size, coherent);
+-    return m;
++    if (!d.allocator)
++        d.allocator = std::make_unique<Allocator>(static_cast<drm_state *>(ctx->drm_state)->fd);
++    return d.allocator->allocate(s.width, s.height, s.fourcc);
+ }
+ 
+ API(query_profiles, (VADriverContextP ctx, VAProfile *out, int *count), (void)d;
+@@ -798,15 +780,14 @@ API(
+     check(image, "null derived image", VA_STATUS_ERROR_INVALID_PARAMETER);
+     auto s = surface(d, id); synchronize(d, s);
+     check(!s->acquired_handles, "surface handle acquired", VA_STATUS_ERROR_SURFACE_BUSY);
+-    if (!s->memory) s->memory = allocate_undecoded_surface(ctx, *s); auto m = s->memory;
++    if (!s->memory) s->memory = allocate_undecoded_surface(ctx, d, *s); auto m = s->memory;
+     VAImage result{}; result.image_id = d.next_id++; result.buf = d.next_id++;
+     result.format = image_format(m->fourcc); result.width = s->width; result.height = s->height;
+-    result.data_size = m->size; result.num_planes = 2;
++    result.data_size = m->mapping_size(); result.num_planes = 2;
+     result.pitches[0] = result.pitches[1] = m->stride; result.offsets[0] = m->data_offset;
+-    result.offsets[1] = m->data_offset + m->stride * m->storage_height;
+-    auto b = std::make_shared<Buffer>(); b->type = VAImageBufferType;
+-    b->element_size = result.data_size; b->elements = 1; b->parent = s; b->memory = m;
+-    ++s->derived_images; d.buffers[result.buf] = b;
++    result.offsets[1] = m->chroma_mapping_offset(); auto b = std::make_shared<Buffer>();
++    b->type = VAImageBufferType; b->element_size = result.data_size; b->elements = 1; b->parent = s;
++    b->memory = m; ++s->derived_images; d.buffers[result.buf] = b;
+     try { d.images[result.image_id] = result; } catch (...) {
+         d.buffers.erase(result.buf);
+         throw;
+@@ -828,7 +809,7 @@ API(
+           VA_STATUS_ERROR_SURFACE_BUSY);
+     check((s->fourcc == VA_FOURCC_P010) == (image.format.fourcc == VA_FOURCC_P010),
+           "image bit depth conversion unsupported", VA_STATUS_ERROR_INVALID_IMAGE_FORMAT);
+-    if (!s->memory) s->memory = allocate_undecoded_surface(ctx, *s); auto m = s->memory;
++    if (!s->memory) s->memory = allocate_undecoded_surface(ctx, d, *s); auto m = s->memory;
+     auto source_buffer = buffer(d, image.buf); ImageMapping source(source_buffer);
+     auto destination_buffer = std::make_shared<Buffer>(); destination_buffer->parent = s;
+     destination_buffer->memory = m; ++s->derived_images;
+@@ -838,8 +819,8 @@ API(
+                     source.data + image.offsets[0] + (sy + row) * image.pitches[0] + sx * bytes,
+                     sw *bytes);
+     for (unsigned row = 0; row < sh / 2; ++row) {
+-        auto uv = destination.data + m->data_offset +
+-                  (m->storage_height + dy / 2 + row) * m->stride + dx * bytes;
++        auto uv = destination.data + m->chroma_mapping_offset() + size_t(dy / 2 + row) * m->stride +
++                  dx * bytes;
+         if (image.format.fourcc == VA_FOURCC_I420) {
+             for (unsigned col = 0; col < sw / 2; ++col) {
+                 uv[2 * col] =
+@@ -861,6 +842,9 @@ API(acquire_buffer_handle, (VADriverContextP ctx, VABufferID id, VABufferInfo *i
+     auto b = buffer(d, id);
+     check(bool(b->memory), "only derived image buffers have DMA-BUF handles",
+           VA_STATUS_ERROR_UNSUPPORTED_BUFFERTYPE);
++    // VABufferInfo carries one handle; use vaExportSurfaceHandle instead.
++    check(!b->memory->split(), "two-object surfaces have no single buffer handle",
++          VA_STATUS_ERROR_UNSUPPORTED_MEMORY_TYPE);
+     check(!info->mem_type || (info->mem_type & VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME),
+           "buffer handle requires DRM PRIME", VA_STATUS_ERROR_UNSUPPORTED_MEMORY_TYPE);
+     synchronize(d, b->parent); check(!b->parent->acquired_handles && !b->parent->mapped_images,
+@@ -900,12 +884,12 @@ API(
+     check(uint64_t(x) + w <= m->width && uint64_t(y) + h <= m->height,
+           "image exceeds CAPTURE layout");
+     uint8_t *base = m->map() + m->data_offset;
+-    dma_buf_sync sync{DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ};
+-    check(ioctl(m->fd, DMA_BUF_IOCTL_SYNC, &sync) == 0, "DMA-BUF read synchronization failed");
++    check(m->sync(DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ), "DMA-BUF read synchronization failed");
+     for (unsigned row = 0; row < h; ++row)
+         std::memcpy(destination.data + image.offsets[0] + row * image.pitches[0],
+                     base + (y + row) * m->stride + x * bytes_per_sample, w *bytes_per_sample);
+-    uint8_t *uv = base + m->stride * m->storage_height + (y / 2) * m->stride + x * bytes_per_sample;
++    uint8_t *uv = m->map() + m->chroma_mapping_offset() + size_t(y / 2) * m->stride +
++                  x * bytes_per_sample;
+     for (unsigned row = 0; row < (h + 1) / 2; ++row) {
+         if (image.format.fourcc != VA_FOURCC_I420)
+             std::memcpy(destination.data + image.offsets[1] + row * image.pitches[1],
+@@ -917,8 +901,8 @@ API(
+                 destination.data[image.offsets[2] + row * image.pitches[2] + col] =
+                     uv[row * m->stride + 2 * col + 1];
+             }
+-    } sync.flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ;
+-    check(ioctl(m->fd, DMA_BUF_IOCTL_SYNC, &sync) == 0, "DMA-BUF read synchronization end failed");
++    } check(m->sync(DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ),
++            "DMA-BUF read synchronization end failed");
+     destination.finish(); return VA_STATUS_SUCCESS;)
+ API(
+     export_surface,
+@@ -928,25 +912,32 @@ API(
+           VA_STATUS_ERROR_UNSUPPORTED_MEMORY_TYPE);
+     auto s = surface(d, id); synchronize(d, s);
+     // GPU producers such as Sunshine render into exported encoder input.
+-    // Independent storage is writable: Iris CAPTURE allocations
++    // Independent storage is writable: decoder CAPTURE allocations
+     // may still be decoder references and have cached CPU aliases.
+     check(!(flags & VA_EXPORT_SURFACE_WRITE_ONLY) || !s->memory ||
+-              s->memory->origin == MemoryOrigin::MsmCoherent ||
+-              s->memory->origin == MemoryOrigin::MsmWriteCombined ||
+-              s->memory->origin == MemoryOrigin::DmaHeap ||
+-              s->memory->origin == MemoryOrigin::Imported,
++              independent_storage(s->memory->origin),
+           "writable export requires independent storage", VA_STATUS_ERROR_UNIMPLEMENTED);
+-    if (!s->memory) s->memory = allocate_undecoded_surface(ctx, *s); auto m = s->memory;
++    if (!s->memory) s->memory = allocate_undecoded_surface(ctx, d, *s); auto m = s->memory;
+     auto &desc = *static_cast<VADRMPRIMESurfaceDescriptor *>(out); desc = {};
+-    desc.fourcc = m->fourcc; desc.width = s->width; desc.height = s->height; desc.num_objects = 1;
+-    desc.objects[0].fd = fcntl(m->fd, F_DUPFD_CLOEXEC, 0);
+-    check(desc.objects[0].fd >= 0, "duplicate DMA-BUF fd"); if (!s->token) {
++    desc.fourcc = m->fourcc; desc.width = s->width; desc.height = s->height;
++    // Linlon CAPTURE planes are separate DMA-BUFs: describe them as two
++    // objects. All other storage carries both planes in one object.
++    desc.num_objects = m->split() ? 2 : 1;
++    for (unsigned i = 0; i < desc.num_objects; ++i) {
++        desc.objects[i].fd = fcntl(i ? m->chroma_fd : m->fd, F_DUPFD_CLOEXEC, 0);
++        if (desc.objects[i].fd < 0) {
++            for (unsigned j = 0; j < i; ++j)
++                close(desc.objects[j].fd);
++            throw Error(VA_STATUS_ERROR_OPERATION_FAILED, "duplicate DMA-BUF fd");
++        }
++        desc.objects[i].size = i ? m->chroma_size : m->size;
++        desc.objects[i].drm_format_modifier = DRM_FORMAT_MOD_LINEAR;
++    } if (!s->token) {
+         if (!s->persistent_export)
+             trace("surface=%#x persistent GEM export (copy if later decoded)", id);
+         s->persistent_export = true;
+-    } desc.objects[0]
+-                                                                .size = m->size;
+-    desc.objects[0].drm_format_modifier = DRM_FORMAT_MOD_LINEAR;
++    } const uint32_t chroma_object = m->split() ? 1 : 0;
++    const auto chroma_offset = uint32_t(m->chroma_object_offset());
+     if (!(flags & VA_EXPORT_SURFACE_COMPOSED_LAYERS)) {
+         desc.num_layers = 2;
+         desc.layers[0].drm_format = m->fourcc == VA_FOURCC_P010 ? DRM_FORMAT_R16 : DRM_FORMAT_R8;
+@@ -954,16 +945,19 @@ API(
+             m->fourcc == VA_FOURCC_P010 ? DRM_FORMAT_GR1616 : DRM_FORMAT_GR88;
+         for (unsigned i = 0; i < 2; ++i) {
+             desc.layers[i].num_planes = 1;
++            desc.layers[i].object_index[0] = i ? chroma_object : 0;
+             desc.layers[i].pitch[0] = m->stride;
+-            desc.layers[i].offset[0] = m->data_offset + (i ? m->stride * m->storage_height : 0);
++            desc.layers[i].offset[0] = i ? chroma_offset : m->data_offset;
+         }
+     } else {
+         desc.num_layers = 1;
+         desc.layers[0].drm_format = m->fourcc == VA_FOURCC_P010 ? DRM_FORMAT_P010 : DRM_FORMAT_NV12;
+         desc.layers[0].num_planes = 2;
++        desc.layers[0].object_index[0] = 0;
++        desc.layers[0].object_index[1] = chroma_object;
+         desc.layers[0].pitch[0] = desc.layers[0].pitch[1] = m->stride;
+         desc.layers[0].offset[0] = m->data_offset;
+-        desc.layers[0].offset[1] = m->data_offset + m->stride * m->storage_height;
++        desc.layers[0].offset[1] = chroma_offset;
+     } return VA_STATUS_SUCCESS;)
+ 
+ API(query_vpp_filters,
+@@ -1010,7 +1004,7 @@ extern "C" VAStatus __vaDriverInit_1_0(VADriverContextP ctx) {
+         ctx->max_image_formats = 3;
+         ctx->max_subpic_formats = 1;
+         ctx->max_display_attributes = 1;
+-        ctx->str_vendor = "Iris V4L2 stateful VA-API backend";
++        ctx->str_vendor = "V4L2 stateful VA-API backend (Qualcomm Iris, Arm Linlon)";
+         auto &v = *ctx->vtable;
+         if (ctx->vtable_vpp && vpp_supported(VAProfileNone, VAEntrypointVideoProc)) {
+             auto &vpp = *ctx->vtable_vpp;
+diff --git a/src/decoder.cpp b/src/decoder.cpp
+index 573a693..9eaf534 100644
+--- a/src/decoder.cpp
++++ b/src/decoder.cpp
+@@ -1,5 +1,6 @@
+ // SPDX-License-Identifier: MIT
+ #include "internal.hpp"
++#include <linux/dma-buf.h>
+ #include <linux/videodev2.h>
+ #include <sys/ioctl.h>
+ #include <sys/mman.h>
+@@ -7,12 +8,17 @@
+ #include <unistd.h>
+ #include <poll.h>
+ #include <glob.h>
++#include <climits>
+ #include <cerrno>
++#include <set>
+ 
+ namespace irisva {
+ namespace {
+ constexpr unsigned OUTPUT = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
+ constexpr unsigned CAPTURE = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
++// Arm Linlon (mvx) private control, V4L2_CTRL_CLASS_CODEC + 0x2000 + 7.
++// It is looked up by name first; the ID is only a fallback.
++constexpr uint32_t MVX_CID_FRAME_REORDERING = 0x00992007;
+ int call(int fd, unsigned long command, void *p) {
+     int r;
+     do {
+@@ -24,46 +30,156 @@ void checked(int fd, unsigned long command, void *p, const char *name) {
+     if (call(fd, command, p) < 0)
+         throw Error(VA_STATUS_ERROR_OPERATION_FAILED, std::string(name) + ": " + strerror(errno));
+ }
++// Multi-planar buffer descriptor. The plane count must match the queue:
++// Iris uses one plane, Linlon reports NV12/P010 CAPTURE as two planes.
+ struct QueueBuffer {
+-    v4l2_plane plane{};
++    v4l2_plane planes[VIDEO_MAX_PLANES]{};
+     v4l2_buffer buffer{};
+-    explicit QueueBuffer(unsigned type, unsigned index = 0) {
++    explicit QueueBuffer(unsigned type, unsigned index = 0, unsigned count = 1) {
+         buffer.type = type;
+         buffer.index = index;
+         buffer.memory = V4L2_MEMORY_MMAP;
+-        buffer.length = 1;
+-        buffer.m.planes = &plane;
++        buffer.length = count;
++        buffer.m.planes = planes;
+     }
+ };
+ bool expired(std::chrono::steady_clock::time_point start) {
+     return std::chrono::steady_clock::now() - start > std::chrono::seconds(5);
+ }
++size_t page_round(size_t size) {
++    static const size_t page = [] {
++        long p = sysconf(_SC_PAGESIZE);
++        return p > 0 ? size_t(p) : size_t(4096);
++    }();
++    return (size + page - 1) / page * page;
++}
++const char *driver_name(CodecDriver driver) {
++    return driver == CodecDriver::Iris ? "iris" : driver == CodecDriver::Mvx ? "mvx" : "unknown";
++}
++std::string sysfs_name(const std::string &node) {
++    auto slash = node.rfind('/');
++    std::string path = "/sys/class/video4linux/" +
++                       node.substr(slash == std::string::npos ? 0 : slash + 1) + "/name";
++    std::string name;
++    if (FILE *f = fopen(path.c_str(), "re")) {
++        char line[64] = {};
++        if (fgets(line, sizeof(line), f))
++            name = line;
++        fclose(f);
++    }
++    while (!name.empty() && (name.back() == '\n' || name.back() == ' '))
++        name.pop_back();
++    return name;
++}
++bool known_codec_node(const std::string &name) {
++    // Linlon registers "mvxdec"/"mvxenc"; Iris "qcom-iris-decoder/encoder".
++    return name == "mvxdec" || name == "mvxenc" || name.rfind("qcom-iris", 0) == 0;
++}
+ } // namespace
++
+ Memory::~Memory() {
+     fastcv_registration.reset();
+     if (mapping)
+-        munmap(mapping, size);
++        munmap(mapping, mapping_size());
+     if (fd >= 0)
+         close(fd);
++    if (chroma_fd >= 0)
++        close(chroma_fd);
++}
++size_t Memory::mapping_size() const {
++    return split() ? page_round(size) + page_round(chroma_size) : size;
++}
++size_t Memory::chroma_mapping_offset() const {
++    return split() ? page_round(size) + chroma_offset
++                   : size_t(data_offset) + size_t(stride) * storage_height;
+ }
+ uint8_t *Memory::map() {
+     if (!mapping) {
+-        void *p = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+-        check(p != MAP_FAILED, "mmap DMA-BUF failed");
+-        mapping = p;
++        if (!split()) {
++            void *p = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
++            check(p != MAP_FAILED, "mmap DMA-BUF failed");
++            mapping = p;
++        } else {
++            // Reserve one range, then place both planes in it. VAImage and the
++            // CPU copy paths can then address chroma relative to one pointer.
++            const size_t luma = page_round(size), total = mapping_size();
++            void *base =
++                mmap(nullptr, total, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
++            check(base != MAP_FAILED, "reserve split DMA-BUF mapping failed");
++            auto *bytes = static_cast<uint8_t *>(base);
++            if (mmap(bytes, size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, 0) ==
++                    MAP_FAILED ||
++                mmap(bytes + luma, chroma_size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED,
++                     chroma_fd, 0) == MAP_FAILED) {
++                munmap(base, total);
++                throw Error(VA_STATUS_ERROR_OPERATION_FAILED, "mmap split DMA-BUF failed");
++            }
++            mapping = base;
++        }
+     }
+     return static_cast<uint8_t *>(mapping);
+ }
+-std::string find_device() {
++bool Memory::sync(uint64_t flags) const {
++    for (int object : {fd, chroma_fd}) {
++        if (object < 0)
++            continue;
++        dma_buf_sync request{flags};
++        if (call(object, DMA_BUF_IOCTL_SYNC, &request) < 0)
++            return false;
++    }
++    return true;
++}
++
++CodecDriver codec_driver(int fd) {
++    v4l2_capability cap{};
++    if (call(fd, VIDIOC_QUERYCAP, &cap) < 0)
++        return CodecDriver::Unknown;
++    const char *name = reinterpret_cast<const char *>(cap.driver);
++    if (!strcmp(name, "iris_driver"))
++        return CodecDriver::Iris;
++    if (!strcmp(name, "mvx"))
++        return CodecDriver::Mvx;
++    return CodecDriver::Unknown;
++}
++uint32_t find_control(int fd, const char *name) {
++    v4l2_queryctrl query{};
++    query.id = V4L2_CTRL_FLAG_NEXT_CTRL;
++    while (call(fd, VIDIOC_QUERYCTRL, &query) == 0) {
++        if (!(query.flags & V4L2_CTRL_FLAG_DISABLED) &&
++            !strcmp(reinterpret_cast<const char *>(query.name), name))
++            return query.id;
++        query.id |= V4L2_CTRL_FLAG_NEXT_CTRL;
++    }
++    return 0;
++}
++std::string find_codec_device(bool encoder, const char *const *environment) {
+     std::vector<std::string> paths;
+-    if (const char *p = std::getenv("IRIS_VAAPI_DEVICE"))
+-        paths.push_back(p);
+-    else {
++    bool explicit_device = false;
++    for (; environment && *environment; ++environment)
++        if (const char *p = std::getenv(*environment)) {
++            paths.emplace_back(p);
++            explicit_device = true;
++            break;
++        }
++    if (!explicit_device) {
+         glob_t g{};
+         if (!glob("/dev/video*", 0, nullptr, &g))
+             for (size_t i = 0; i < g.gl_pathc; ++i)
+                 paths.emplace_back(g.gl_pathv[i]);
+         globfree(&g);
++        // udev aliases (e.g. /dev/video-cixdec0) resolve to the same nodes.
++        std::set<std::string> unique;
++        std::vector<std::string> known, other;
++        for (const auto &path : paths) {
++            char resolved[PATH_MAX];
++            std::string node = realpath(path.c_str(), resolved) ? resolved : path;
++            if (!unique.insert(node).second)
++                continue;
++            (known_codec_node(sysfs_name(node)) ? known : other).push_back(node);
++        }
++        // Never open unrelated nodes once codec nodes are identified: on CIX
++        // Sky1 the vendor ISP node is known to misbehave on probing.
++        paths = known.empty() ? other : known;
+     }
+     for (const auto &path : paths) {
+         int fd = open(path.c_str(), O_RDWR | O_NONBLOCK | O_CLOEXEC);
+@@ -71,13 +187,14 @@ std::string find_device() {
+             continue;
+         v4l2_capability cap{};
+         bool match = false;
+-        if (!call(fd, VIDIOC_QUERYCAP, &cap) &&
+-            !strcmp(reinterpret_cast<char *>(cap.driver), "iris_driver")) {
++        CodecDriver driver = codec_driver(fd);
++        if ((driver != CodecDriver::Unknown || explicit_device) &&
++            !call(fd, VIDIOC_QUERYCAP, &cap)) {
+             unsigned caps =
+                 cap.capabilities & V4L2_CAP_DEVICE_CAPS ? cap.device_caps : cap.capabilities;
+             if (caps & V4L2_CAP_VIDEO_M2M_MPLANE) {
+                 v4l2_fmtdesc fmt{};
+-                fmt.type = OUTPUT;
++                fmt.type = encoder ? CAPTURE : OUTPUT;
+                 while (!call(fd, VIDIOC_ENUM_FMT, &fmt)) {
+                     if (fmt.pixelformat == V4L2_PIX_FMT_H264)
+                         match = true;
+@@ -86,18 +203,29 @@ std::string find_device() {
+             }
+         }
+         close(fd);
+-        if (match)
++        if (match) {
++            trace("%s device %s driver=%s", encoder ? "encoder" : "decoder", path.c_str(),
++                  driver_name(driver));
+             return path;
++        }
+     }
+-    throw Error(VA_STATUS_ERROR_OPERATION_FAILED, "no Iris stateful H264 decoder found");
++    return {};
++}
++std::string find_device() {
++    static const char *const environment[] = {"LIBVA_V4L2_DECODER_DEVICE", "IRIS_VAAPI_DEVICE",
++                                              nullptr};
++    auto device = find_codec_device(false, environment);
++    check(!device.empty(), "no Iris or Arm Linlon (mvx) stateful H264 decoder found");
++    return device;
+ }
+ Decoder::Decoder(const std::string &device, unsigned width, unsigned height, unsigned surfaces,
+                  VAProfile profile, int render_fd)
+     : width_(width), height_(height), pool_size_(std::min(64u, std::max(32u, surfaces + 4))),
+       fourcc_(is_10bit(profile) ? VA_FOURCC_P010 : VA_FOURCC_NV12), copier_(render_fd) {
+     fd_ = open(device.c_str(), O_RDWR | O_NONBLOCK | O_CLOEXEC);
+-    check(fd_ >= 0, "open Iris decoder");
++    check(fd_ >= 0, "open V4L2 decoder");
+     try {
++        driver_ = codec_driver(fd_);
+         v4l2_event_subscription sub{};
+         sub.type = V4L2_EVENT_SOURCE_CHANGE;
+         checked(fd_, VIDIOC_SUBSCRIBE_EVENT, &sub, "SUBSCRIBE SOURCE_CHANGE");
+@@ -111,23 +239,16 @@ Decoder::Decoder(const std::string &device, unsigned width, unsigned height, uns
+         unsigned codec = fmt.fmt.pix_mp.pixelformat;
+         fmt.fmt.pix_mp.num_planes = 1;
+         checked(fd_, VIDIOC_S_FMT, &fmt, "S_FMT OUTPUT");
+-        check(fmt.fmt.pix_mp.pixelformat == codec, "Iris does not support the requested codec");
+-        v4l2_control delay{};
+-        delay.id = V4L2_CID_MPEG_VIDEO_DEC_DISPLAY_DELAY;
+-        delay.value = 0;
+-        checked(fd_, VIDIOC_S_CTRL, &delay,
+-                "S_CTRL DISPLAY_DELAY (Iris decode-order patch required)");
+-        delay.id = V4L2_CID_MPEG_VIDEO_DEC_DISPLAY_DELAY_ENABLE;
+-        delay.value = 1;
+-        checked(fd_, VIDIOC_S_CTRL, &delay, "S_CTRL DISPLAY_DELAY_ENABLE");
+-        allocate(OUTPUT, 4, output_);
++        check(fmt.fmt.pix_mp.pixelformat == codec, "decoder does not support the requested codec");
++        configure_decode_order(profile);
++        allocate(OUTPUT, 4, 1, output_);
+         unsigned type = OUTPUT;
+         checked(fd_, VIDIOC_STREAMON, &type, "STREAMON OUTPUT");
+         output_on_ = true;
+         if (const char *path = std::getenv("IRIS_VAAPI_DUMP"))
+             dump_ = fopen(path, "wb");
+-        trace("Iris session %s %ux%u output-buffers=%zu", device.c_str(), width, height,
+-              output_.size());
++        trace("%s session %s %ux%u output-buffers=%zu", driver_name(driver_), device.c_str(), width,
++              height, output_.size());
+     } catch (...) {
+         close(fd_);
+         fd_ = -1;
+@@ -151,7 +272,45 @@ Decoder::~Decoder() {
+         surface->pending = false;
+     }
+ }
+-void Decoder::allocate(unsigned type, unsigned count, std::vector<std::shared_ptr<Memory>> &pool) {
++void Decoder::configure_decode_order(VAProfile profile) {
++    (void)profile;
++    // Every VA picture must complete independently: request decode-order
++    // output. Iris uses the standard display-delay controls (patched kernel).
++    v4l2_control delay{};
++    delay.id = V4L2_CID_MPEG_VIDEO_DEC_DISPLAY_DELAY;
++    delay.value = 0;
++    if (call(fd_, VIDIOC_S_CTRL, &delay) == 0) {
++        delay.id = V4L2_CID_MPEG_VIDEO_DEC_DISPLAY_DELAY_ENABLE;
++        delay.value = 1;
++        checked(fd_, VIDIOC_S_CTRL, &delay, "S_CTRL DISPLAY_DELAY_ENABLE");
++        return;
++    }
++    if (driver_ != CodecDriver::Mvx)
++        throw Error(VA_STATUS_ERROR_OPERATION_FAILED,
++                    std::string("S_CTRL DISPLAY_DELAY (Iris decode-order patch required): ") +
++                        strerror(errno));
++    // Linlon: the firmware option MVE_SET_OPT_INDEX_FRAME_REORDERING receives
++    // the control value as-is, and arg 0 disables reordering. The driver's
++    // tristate names are inverted (MVX_TRI_TRUE == 0), so 0 is correct here.
++    // It must be set before STREAMON, when the firmware is loaded.
++    uint32_t id = find_control(fd_, "frame reordering");
++    if (!id) {
++        v4l2_queryctrl query{};
++        query.id = MVX_CID_FRAME_REORDERING;
++        check(call(fd_, VIDIOC_QUERYCTRL, &query) == 0 && query.type == V4L2_CTRL_TYPE_INTEGER &&
++                  query.minimum == -1 && query.maximum == 1,
++              "Linlon frame reordering control not found");
++        id = query.id;
++    }
++    v4l2_control reorder{};
++    reorder.id = id;
++    reorder.value = 0;
++    checked(fd_, VIDIOC_S_CTRL, &reorder, "S_CTRL Linlon frame reordering");
++    trace("Linlon decode-order output enabled (control %#x)", id);
++}
++void Decoder::allocate(unsigned type, unsigned count, unsigned planes,
++                       std::vector<std::shared_ptr<Memory>> &pool) {
++    check(planes >= 1 && planes <= 2, "unsupported V4L2 plane count");
+     v4l2_requestbuffers req{};
+     req.type = type;
+     req.memory = V4L2_MEMORY_MMAP;
+@@ -159,28 +318,48 @@ void Decoder::allocate(unsigned type, unsigned count, std::vector<std::shared_pt
+     checked(fd_, VIDIOC_REQBUFS, &req, "REQBUFS");
+     check(req.count > 0 && req.count <= 64, "invalid allocated buffer count");
+     for (unsigned i = 0; i < req.count; ++i) {
+-        QueueBuffer q(type, i);
++        QueueBuffer q(type, i, planes);
+         checked(fd_, VIDIOC_QUERYBUF, &q.buffer, "QUERYBUF");
++        check(q.buffer.length == planes, "unexpected V4L2 buffer plane count");
+         auto m = std::make_shared<Memory>();
+         m->origin = MemoryOrigin::Iris;
+         m->index = i;
+-        m->size = q.plane.length;
++        m->size = q.planes[0].length;
+         if (type == OUTPUT) {
+             void *p = mmap(nullptr, m->size, PROT_READ | PROT_WRITE, MAP_SHARED, fd_,
+-                           q.plane.m.mem_offset);
++                           q.planes[0].m.mem_offset);
+             check(p != MAP_FAILED, "mmap OUTPUT");
+             m->mapping = p;
+         } else {
+-            v4l2_exportbuffer exp{};
+-            exp.type = type;
+-            exp.index = i;
+-            exp.flags = O_CLOEXEC | O_RDWR;
+-            checked(fd_, VIDIOC_EXPBUF, &exp, "EXPBUF");
+-            m->fd = exp.fd;
++            for (unsigned p = 0; p < planes; ++p) {
++                v4l2_exportbuffer exp{};
++                exp.type = type;
++                exp.index = i;
++                exp.plane = p;
++                exp.flags = O_CLOEXEC | O_RDWR;
++                checked(fd_, VIDIOC_EXPBUF, &exp, "EXPBUF");
++                if (p) {
++                    m->chroma_fd = exp.fd;
++                    m->chroma_size = q.planes[p].length;
++                } else {
++                    m->fd = exp.fd;
++                }
++            }
+         }
+         pool.push_back(m);
+     }
+ }
++bool Decoder::capture_format_unchanged() {
++    v4l2_format fmt{};
++    fmt.type = CAPTURE;
++    if (capture_.empty() || call(fd_, VIDIOC_G_FMT, &fmt) < 0)
++        return false;
++    const auto &p = fmt.fmt.pix_mp;
++    const auto &m = *capture_.front();
++    unsigned pixel_format = fourcc_ == VA_FOURCC_P010 ? V4L2_PIX_FMT_P010 : V4L2_PIX_FMT_NV12;
++    return p.pixelformat == pixel_format && p.num_planes == capture_planes_ && p.width == m.width &&
++           p.height == m.height && p.plane_fmt[0].bytesperline == capture_bytesperline_;
++}
+ void Decoder::configure_capture() {
+     check(!capture_on_, "in-context dynamic resolution change not yet implemented",
+           VA_STATUS_ERROR_UNIMPLEMENTED);
+@@ -189,9 +368,28 @@ void Decoder::configure_capture() {
+     checked(fd_, VIDIOC_G_FMT, &fmt, "G_FMT CAPTURE");
+     unsigned pixel_format = fourcc_ == VA_FOURCC_P010 ? V4L2_PIX_FMT_P010 : V4L2_PIX_FMT_NV12;
+     fmt.fmt.pix_mp.pixelformat = pixel_format;
++    if (driver_ == CodecDriver::Mvx) {
++        // Linlon always describes NV12/P010 as two discrete planes and
++        // otherwise chooses a pitch of exactly width * bytes. Request a
++        // 128-byte pitch so Mali (Panfrost) and display engines can import
++        // the decoded planes without copies.
++        unsigned bytes = fourcc_ == VA_FOURCC_P010 ? 2 : 1;
++        unsigned pitch = (fmt.fmt.pix_mp.width * bytes + 127) & ~127u;
++        fmt.fmt.pix_mp.num_planes = 2;
++        for (unsigned p = 0; p < 2; ++p) {
++            fmt.fmt.pix_mp.plane_fmt[p].bytesperline = pitch;
++            fmt.fmt.pix_mp.plane_fmt[p].sizeimage = 0;
++        }
++    }
+     checked(fd_, VIDIOC_S_FMT, &fmt, "S_FMT CAPTURE");
+-    check(fmt.fmt.pix_mp.pixelformat == pixel_format && fmt.fmt.pix_mp.num_planes == 1,
++    const auto &format = fmt.fmt.pix_mp;
++    const unsigned planes = format.num_planes;
++    check(format.pixelformat == pixel_format &&
++              (planes == 1 || (planes == 2 && format.plane_fmt[1].bytesperline ==
++                                                  format.plane_fmt[0].bytesperline)),
+           "unsupported CAPTURE layout");
++    capture_planes_ = planes;
++    capture_bytesperline_ = format.plane_fmt[0].bytesperline;
+     v4l2_control minimum{};
+     minimum.id = V4L2_CID_MIN_BUFFERS_FOR_CAPTURE;
+     checked(fd_, VIDIOC_G_CTRL, &minimum, "G_CTRL minimum capture buffers");
+@@ -199,16 +397,27 @@ void Decoder::configure_capture() {
+     // The firmware minimum alone leaves no room for surfaces retained in VA's
+     // reference/reorder queues. Reserve at least 32 slots and honor larger
+     // renderer pools (VLC), within the patched Iris driver's 64-buffer limit.
+-    trace("CAPTURE pool target=%u firmware-min=%d", pool_size_, minimum.value);
+-    allocate(CAPTURE, std::max(pool_size_, unsigned(minimum.value)), capture_);
+-    check(capture_.size() >= pool_size_,
+-          "CAPTURE pool too small; apply the Iris gen2 capture-pool kernel patch",
+-          VA_STATUS_ERROR_ALLOCATION_FAILED);
++    const unsigned target = std::max(pool_size_, unsigned(std::max(0, minimum.value)));
++    trace("CAPTURE pool target=%u firmware-min=%d planes=%u", target, minimum.value, planes);
++    allocate(CAPTURE, target, planes, capture_);
++    if (driver_ == CodecDriver::Iris) {
++        check(capture_.size() >= pool_size_,
++              "CAPTURE pool too small; apply the Iris gen2 capture-pool kernel patch",
++              VA_STATUS_ERROR_ALLOCATION_FAILED);
++    } else if (capture_.size() < target) {
++        // videobuf2 limits a queue to 32 buffers unless the driver raises it
++        // (Linlon does not). Keep a margin above the firmware's DPB needs.
++        check(capture_.size() >= unsigned(std::max(0, minimum.value)) + 4,
++              "CAPTURE pool too small for the stream's reference frames",
++              VA_STATUS_ERROR_ALLOCATION_FAILED);
++        trace("CAPTURE pool limited by driver: granted=%zu wanted=%u", capture_.size(), target);
++        pool_size_ = unsigned(capture_.size());
++    }
+     for (auto &m : capture_) {
+-        m->stride = fmt.fmt.pix_mp.plane_fmt[0].bytesperline;
+-        m->storage_height = fmt.fmt.pix_mp.height;
+-        m->width = fmt.fmt.pix_mp.width;
+-        m->height = fmt.fmt.pix_mp.height;
++        m->stride = format.plane_fmt[0].bytesperline;
++        m->storage_height = format.height;
++        m->width = format.width;
++        m->height = format.height;
+         m->fourcc = fourcc_;
+     }
+     requeue();
+@@ -216,16 +425,18 @@ void Decoder::configure_capture() {
+     checked(fd_, VIDIOC_STREAMON, &type, "STREAMON CAPTURE");
+     capture_on_ = true;
+     source_change_ = false;
+-    trace("CAPTURE %ux%u pitch=%u count=%zu", fmt.fmt.pix_mp.width, fmt.fmt.pix_mp.height,
+-          fmt.fmt.pix_mp.plane_fmt[0].bytesperline, capture_.size());
++    trace("CAPTURE %ux%u pitch=%u planes=%u count=%zu", format.width, format.height,
++          format.plane_fmt[0].bytesperline, planes, capture_.size());
+ }
+ void Decoder::requeue() {
+     if (last_)
+         return;
+     for (auto &m : capture_) {
+         if (!m->queued && m.use_count() == 1) {
+-            QueueBuffer q(CAPTURE, m->index);
+-            q.plane.length = m->size;
++            QueueBuffer q(CAPTURE, m->index, capture_planes_);
++            q.planes[0].length = m->size;
++            if (capture_planes_ > 1)
++                q.planes[1].length = m->chroma_size;
+             checked(fd_, VIDIOC_QBUF, &q.buffer, "QBUF CAPTURE");
+             m->queued = true;
+         }
+@@ -239,7 +450,7 @@ void Decoder::pump(int timeout_ms) {
+         do {
+             ret = poll(&p, 1, timeout_ms);
+         } while (ret < 0 && errno == EINTR);
+-        check(ret >= 0 && !(p.revents & POLLNVAL), "poll Iris failed");
++        check(ret >= 0 && !(p.revents & POLLNVAL), "poll V4L2 decoder failed");
+     }
+     for (;;) {
+         v4l2_event event{};
+@@ -247,7 +458,13 @@ void Decoder::pump(int timeout_ms) {
+             check(errno == EAGAIN || errno == ENOENT, "DQEVENT failed");
+             break;
+         }
+-        if (event.type == V4L2_EVENT_SOURCE_CHANGE)
++        if (event.type != V4L2_EVENT_SOURCE_CHANGE)
++            continue;
++        // A driver may repeat SOURCE_CHANGE once CAPTURE is streaming even
++        // though nothing changed. Only a real change needs reconfiguration.
++        if (capture_on_ && capture_format_unchanged())
++            trace("%s", "ignoring SOURCE_CHANGE without a CAPTURE format change");
++        else
+             source_change_ = true;
+     }
+     if (source_change_ && !capture_on_)
+@@ -260,13 +477,13 @@ void Decoder::pump(int timeout_ms) {
+         }
+         check(q.buffer.index < output_.size(), "invalid OUTPUT index");
+         output_[q.buffer.index]->queued = false;
+-        check(!(q.buffer.flags & V4L2_BUF_FLAG_ERROR), "Iris bitstream error",
++        check(!(q.buffer.flags & V4L2_BUF_FLAG_ERROR), "decoder bitstream error",
+               VA_STATUS_ERROR_DECODING_ERROR);
+     }
+     if (!capture_on_ || last_)
+         return;
+     for (;;) {
+-        QueueBuffer q(CAPTURE);
++        QueueBuffer q(CAPTURE, 0, capture_planes_);
+         if (call(fd_, VIDIOC_DQBUF, &q.buffer) < 0) {
+             check(errno == EAGAIN || errno == EPIPE, "DQBUF CAPTURE failed");
+             break;
+@@ -274,17 +491,28 @@ void Decoder::pump(int timeout_ms) {
+         check(q.buffer.index < capture_.size(), "invalid CAPTURE index");
+         auto &m = capture_[q.buffer.index];
+         m->queued = false;
++        const auto &luma = q.planes[0];
+         trace("CAPTURE index=%u used=%u offset=%u ts=%lld:%lld flags=%x", q.buffer.index,
+-              q.plane.bytesused, q.plane.data_offset, (long long)q.buffer.timestamp.tv_sec,
++              luma.bytesused, luma.data_offset, (long long)q.buffer.timestamp.tv_sec,
+               (long long)q.buffer.timestamp.tv_usec, q.buffer.flags);
+-        if (q.plane.bytesused > q.plane.data_offset) {
+-            uint64_t token =
+-                uint64_t(q.buffer.timestamp.tv_sec) * 1000000 + q.buffer.timestamp.tv_usec;
++        const uint64_t token =
++            uint64_t(q.buffer.timestamp.tv_sec) * 1000000 + q.buffer.timestamp.tv_usec;
++        // Linlon can emit two pictures for one OUTPUT buffer: a decode-only
++        // (hidden VP9) frame, which completes the VA surface, then the shown
++        // copy requested by show-existing. The repeat is simply requeued.
++        const bool repeated =
++            driver_ == CodecDriver::Mvx && token && token < next_token_ && !pending_.count(token);
++        if (repeated)
++            trace("ignoring repeated CAPTURE token=%llu index=%u flags=%x",
++                  (unsigned long long)token, q.buffer.index, q.buffer.flags);
++        if (luma.bytesused > luma.data_offset && !repeated) {
+             auto it = pending_.find(token);
+             check(it != pending_.end(), "unmatched CAPTURE timestamp",
+                   VA_STATUS_ERROR_DECODING_ERROR);
+             auto surface = it->second;
+-            m->data_offset = q.plane.data_offset;
++            m->data_offset = luma.data_offset;
++            if (capture_planes_ > 1)
++                m->chroma_offset = q.planes[1].data_offset;
+             surface->status = q.buffer.flags & V4L2_BUF_FLAG_ERROR ? VA_STATUS_ERROR_DECODING_ERROR
+                                                                    : VA_STATUS_SUCCESS;
+             if (surface->status == VA_STATUS_SUCCESS && surface->persistent_export) {
+@@ -345,10 +573,15 @@ void Decoder::submit(const std::vector<uint8_t> &bytes, const std::shared_ptr<Su
+     }
+     uint64_t token = next_token_++;
+     QueueBuffer q(OUTPUT, slot->index);
+-    q.plane.bytesused = bytes.size();
+-    q.plane.length = slot->size;
++    q.planes[0].bytesused = bytes.size();
++    q.planes[0].length = slot->size;
+     q.buffer.timestamp.tv_sec = token / 1000000;
+     q.buffer.timestamp.tv_usec = token % 1000000;
++    // Linlon marks the end of a compressed frame with KEYFRAME on OUTPUT
++    // (MVX_BUFFER_EOF). Without it the firmware waits for the next frame's
++    // start code, so a picture only completes after a later submission.
++    if (driver_ == CodecDriver::Mvx)
++        q.buffer.flags |= V4L2_BUF_FLAG_KEYFRAME;
+     checked(fd_, VIDIOC_QBUF, &q.buffer, "QBUF OUTPUT");
+     slot->queued = true;
+     surface->pending = true;
+diff --git a/src/encoder.cpp b/src/encoder.cpp
+index 2ab6bc4..4ae122a 100644
+--- a/src/encoder.cpp
++++ b/src/encoder.cpp
+@@ -26,17 +26,56 @@ void checked(int fd, unsigned long command, void *arg, const char *name) {
+     if (call(fd, command, arg) < 0)
+         throw Error(VA_STATUS_ERROR_ENCODING_ERROR, std::string(name) + ": " + strerror(errno));
+ }
++// The plane count must match the queue: Linlon describes NV12 input as two
++// discrete planes, Iris as one. Coded CAPTURE buffers always have one plane.
+ struct QueueBuffer {
+-    v4l2_plane plane{};
++    v4l2_plane planes[VIDEO_MAX_PLANES]{};
++    v4l2_plane &plane = planes[0];
+     v4l2_buffer buffer{};
+-    explicit QueueBuffer(unsigned type, unsigned index = 0, bool import = false) {
++    explicit QueueBuffer(unsigned type, unsigned index = 0, bool import = false,
++                         unsigned count = 1) {
+         buffer.type = type;
+         buffer.index = index;
+         buffer.memory = type == OUTPUT && import ? V4L2_MEMORY_DMABUF : V4L2_MEMORY_MMAP;
+-        buffer.length = 1;
+-        buffer.m.planes = &plane;
++        buffer.length = count;
++        buffer.m.planes = planes;
+     }
++    QueueBuffer(const QueueBuffer &) = delete;
++    QueueBuffer &operator=(const QueueBuffer &) = delete;
+ };
++bool parameter_set(unsigned type, bool hevc) {
++    return hevc ? type == 32 || type == 33 || type == 34 : type == 7 || type == 8;
++}
++bool vcl(unsigned type, bool hevc) {
++    return hevc ? type < 32 : type >= 1 && type <= 5;
++}
++bool random_access(unsigned type, bool hevc) {
++    return hevc ? type >= 16 && type <= 21 : type == 5;
++}
++// Annex B prefix of a coded buffer, scanned only up to its first slice:
++// parameter sets always precede the VCL NAL units they apply to.
++struct NalPrefix {
++    bool parameters = false, slice = false, random_access = false;
++    size_t first_slice = 0; // Start-code offset of the first VCL NAL unit.
++};
++NalPrefix scan_prefix(const uint8_t *data, size_t size, bool hevc) {
++    NalPrefix result;
++    result.first_slice = size;
++    for (size_t i = 0; i + 3 < size; ++i) {
++        if (data[i] || data[i + 1] || data[i + 2] != 1)
++            continue;
++        const unsigned type = hevc ? (data[i + 3] >> 1) & 63 : data[i + 3] & 31;
++        result.parameters |= parameter_set(type, hevc);
++        if (vcl(type, hevc)) {
++            result.slice = true;
++            result.random_access = random_access(type, hevc);
++            result.first_slice = i && !data[i - 1] ? i - 1 : i;
++            break;
++        }
++        i += 2;
++    }
++    return result;
++}
+ template <class T> T parameter(const Buffer &b, size_t offset = 0) {
+     check(b.elements == 1 && b.data.size() >= offset + sizeof(T), "short encode parameter buffer",
+           VA_STATUS_ERROR_INVALID_BUFFER);
+@@ -189,38 +228,9 @@ void validate(const EncodeSettings &s, const EncodePicture &p, unsigned width, u
+ } // namespace
+ 
+ std::string find_encoder_device() {
+-    std::vector<std::string> paths;
+-    if (const char *p = std::getenv("IRIS_VAAPI_ENCODER_DEVICE"))
+-        paths.emplace_back(p);
+-    else {
+-        glob_t g{};
+-        if (!glob("/dev/video*", 0, nullptr, &g))
+-            for (size_t i = 0; i < g.gl_pathc; ++i)
+-                paths.emplace_back(g.gl_pathv[i]);
+-        globfree(&g);
+-    }
+-    for (const auto &path : paths) {
+-        int fd = open(path.c_str(), O_RDWR | O_NONBLOCK | O_CLOEXEC);
+-        if (fd < 0)
+-            continue;
+-        v4l2_capability cap{};
+-        bool match = false;
+-        if (!call(fd, VIDIOC_QUERYCAP, &cap) &&
+-            !strcmp(reinterpret_cast<char *>(cap.driver), "iris_driver") &&
+-            (cap.device_caps & V4L2_CAP_VIDEO_M2M_MPLANE)) {
+-            v4l2_fmtdesc fmt{};
+-            fmt.type = CAPTURE;
+-            while (!call(fd, VIDIOC_ENUM_FMT, &fmt)) {
+-                if (fmt.pixelformat == V4L2_PIX_FMT_H264)
+-                    match = true;
+-                ++fmt.index;
+-            }
+-        }
+-        close(fd);
+-        if (match)
+-            return path;
+-    }
+-    return {};
++    static const char *const environment[] = {"LIBVA_V4L2_ENCODER_DEVICE",
++                                              "IRIS_VAAPI_ENCODER_DEVICE", nullptr};
++    return find_codec_device(true, environment);
+ }
+ 
+ void render_encode_buffer(EncodeSettings &s, EncodePicture &p, const Buffer &b) {
+@@ -329,6 +339,13 @@ void render_encode_buffer(EncodeSettings &s, EncodePicture &p, const Buffer &b)
+ struct Encoder::Impl {
+     int fd = -1, render_fd = -1;
+     bool import = false;
++    CodecDriver driver = CodecDriver::Unknown;
++    // Linlon has no PREPEND_SPSPPS_TO_IDR / HEADER_MODE controls. Its
++    // firmware emits parameter sets once, as a separate CAPTURE buffer.
++    bool emulate_prepend = false;
++    std::vector<uint8_t> pending_header, cached_header;
++    unsigned input_planes = 1;
++    unsigned plane_sizes[2] = {};
+     struct Job {
+         std::shared_ptr<EncodeTask> task;
+         std::shared_ptr<Buffer> output;
+@@ -366,6 +383,17 @@ struct Encoder::Impl {
+         trace("encoder control id=%#x value=%d", id, value);
+         checked(fd, VIDIOC_S_CTRL, &ctrl, "encoder S_CTRL");
+     }
++    // Returns false if the driver does not implement the control at all.
++    bool optional_control(unsigned id, int value) {
++        v4l2_queryctrl query{};
++        query.id = id;
++        if (call(fd, VIDIOC_QUERYCTRL, &query) < 0 || (query.flags & V4L2_CTRL_FLAG_DISABLED)) {
++            trace("encoder control id=%#x unsupported by driver", id);
++            return false;
++        }
++        control(id, value);
++        return true;
++    }
+     void configure_deblocking() {
+         const int ids[] = {settings.hevc ? V4L2_CID_MPEG_VIDEO_HEVC_LOOP_FILTER_MODE
+                                          : V4L2_CID_MPEG_VIDEO_H264_LOOP_FILTER_MODE,
+@@ -389,7 +417,7 @@ struct Encoder::Impl {
+             // Older Iris kernels only expose firmware's enabled, 0/0 default.
+             // Never silently replace a non-default request with that default.
+             check((filter[0] == 0 || (settings.hevc && filter[0] == 2)) && !filter[1] && !filter[2],
+-                  "deblocking request requires Iris loop-filter controls",
++                  "deblocking request requires V4L2 loop-filter controls",
+                   VA_STATUS_ERROR_UNIMPLEMENTED);
+             return;
+         }
+@@ -413,6 +441,32 @@ struct Encoder::Impl {
+         q.plane.length = capture[index]->size;
+         checked(fd, VIDIOC_QBUF, &q.buffer, "encoder QBUF CAPTURE");
+     }
++    // Moves one coded picture into its VA buffer, adding parameter sets the
++    // firmware delivered separately or, for Linlon, only once per stream.
++    void deliver(Buffer &output, const uint8_t *data, unsigned size, const NalPrefix &nal) {
++        const std::vector<uint8_t> *prefix = nullptr;
++        if (!pending_header.empty())
++            prefix = &pending_header;
++        else if (emulate_prepend && nal.random_access && !nal.parameters && !cached_header.empty())
++            prefix = &cached_header;
++        const size_t total = size + (prefix ? prefix->size() : 0);
++        if (total > output.data.size()) {
++            output.coded.status = VA_CODED_BUF_STATUS_SLICE_OVERFLOW_MASK;
++            throw Error(VA_STATUS_ERROR_NOT_ENOUGH_BUFFER, "coded buffer too small");
++        }
++        size_t offset = 0;
++        if (prefix) {
++            std::memcpy(output.data.data(), prefix->data(), prefix->size());
++            offset = prefix->size();
++        }
++        std::memcpy(output.data.data() + offset, data, size);
++        // Remember in-band parameter sets for later forced keyframes.
++        if (nal.parameters)
++            cached_header.assign(data, data + nal.first_slice);
++        pending_header.clear();
++        output.coded.size = unsigned(total);
++        output.coded.buf = output.data.data();
++    }
+     void stop(VAStatus status) noexcept {
+         if (fd >= 0) {
+             unsigned type = OUTPUT;
+@@ -440,7 +494,7 @@ struct Encoder::Impl {
+             return;
+         try {
+             for (;;) {
+-                QueueBuffer q(OUTPUT, 0, import);
++                QueueBuffer q(OUTPUT, 0, import, input_planes);
+                 if (call(fd, VIDIOC_DQBUF, &q.buffer) < 0) {
+                     check(errno == EAGAIN, "encoder DQBUF OUTPUT failed",
+                           VA_STATUS_ERROR_ENCODING_ERROR);
+@@ -468,21 +522,23 @@ struct Encoder::Impl {
+                 check(q.plane.data_offset <= q.plane.bytesused && q.plane.bytesused <= memory->size,
+                       "invalid encoder bitstream range", VA_STATUS_ERROR_ENCODING_ERROR);
+                 unsigned size = q.plane.bytesused - q.plane.data_offset;
+-                if (size) {
++                const uint8_t *data = memory->map() + q.plane.data_offset;
++                // A buffer of only parameter sets (Linlon codec-config output)
++                // belongs to the next picture, whatever its timestamp; never
++                // match it against a job.
++                const auto nal = scan_prefix(data, size, settings.hevc);
++                if (size && nal.parameters && !nal.slice) {
++                    pending_header.insert(pending_header.end(), data, data + size);
++                    cached_header = pending_header;
++                    trace("encoder parameter sets bytes=%u", size);
++                } else if (size) {
+                     uint64_t token =
+                         uint64_t(q.buffer.timestamp.tv_sec) * 1000000 + q.buffer.timestamp.tv_usec;
+                     auto it = jobs.find(token);
+                     check(it != jobs.end() && !it->second->frame_done, "encoder timestamp mismatch",
+                           VA_STATUS_ERROR_ENCODING_ERROR);
+                     auto &job = *it->second;
+-                    auto &output = *job.output;
+-                    if (size > output.data.size()) {
+-                        output.coded.status = VA_CODED_BUF_STATUS_SLICE_OVERFLOW_MASK;
+-                        throw Error(VA_STATUS_ERROR_NOT_ENOUGH_BUFFER, "coded buffer too small");
+-                    }
+-                    std::memcpy(output.data.data(), memory->map() + q.plane.data_offset, size);
+-                    output.coded.size = size;
+-                    output.coded.buf = output.data.data();
++                    deliver(*job.output, data, size, nal);
+                     job.frame_done = true;
+                 }
+                 queue_capture(q.buffer.index);
+@@ -581,13 +637,16 @@ Encoder::Encoder(const std::string &device, unsigned width, unsigned height, VAP
+     e.filter = deblocking(p, s.hevc);
+     e.render_fd = fcntl(render_fd, F_DUPFD_CLOEXEC, 0);
+     check(e.render_fd >= 0, "duplicate encoder DRM fd");
++    // Zero-copy DMABUF input needs coherent MSM GEM (Qualcomm). Elsewhere,
++    // including Panthor on CIX Sky1, raw frames are copied into MMAP input.
+     int coherent = 0;
+     int probe = irisva_msm_allocate(e.render_fd, 4096, &coherent);
+-    check(probe >= 0, "probe encoder shared memory", VA_STATUS_ERROR_ALLOCATION_FAILED);
+-    close(probe);
+-    e.import = coherent;
++    if (probe >= 0)
++        close(probe);
+     e.fd = open(device.c_str(), O_RDWR | O_NONBLOCK | O_CLOEXEC);
+-    check(e.fd >= 0, "open Iris encoder");
++    check(e.fd >= 0, "open V4L2 encoder");
++    e.driver = codec_driver(e.fd);
++    e.import = probe >= 0 && coherent && e.driver != CodecDriver::Mvx;
+     v4l2_format fmt{};
+     fmt.type = CAPTURE;
+     fmt.fmt.pix_mp.width = width;
+@@ -595,7 +654,8 @@ Encoder::Encoder(const std::string &device, unsigned width, unsigned height, VAP
+     fmt.fmt.pix_mp.pixelformat = s.hevc ? V4L2_PIX_FMT_HEVC : V4L2_PIX_FMT_H264;
+     checked(e.fd, VIDIOC_S_FMT, &fmt, "encoder S_FMT coded format");
+     check(fmt.fmt.pix_mp.pixelformat == (s.hevc ? V4L2_PIX_FMT_HEVC : V4L2_PIX_FMT_H264),
+-          "Iris does not support the requested encode format", VA_STATUS_ERROR_UNSUPPORTED_PROFILE);
++          "encoder does not support the requested encode format",
++          VA_STATUS_ERROR_UNSUPPORTED_PROFILE);
+     fmt = {};
+     fmt.type = OUTPUT;
+     fmt.fmt.pix_mp.width = width;
+@@ -603,8 +663,18 @@ Encoder::Encoder(const std::string &device, unsigned width, unsigned height, VAP
+     fmt.fmt.pix_mp.pixelformat = V4L2_PIX_FMT_NV12;
+     fmt.fmt.pix_mp.field = V4L2_FIELD_NONE;
+     checked(e.fd, VIDIOC_S_FMT, &fmt, "encoder S_FMT NV12");
+-    check(fmt.fmt.pix_mp.pixelformat == V4L2_PIX_FMT_NV12 && fmt.fmt.pix_mp.num_planes == 1,
+-          "unsupported Iris encoder input layout");
++    {
++        const auto &input = fmt.fmt.pix_mp;
++        // Linlon describes NV12 as two discrete planes sharing one pitch.
++        check(input.pixelformat == V4L2_PIX_FMT_NV12 &&
++                  (input.num_planes == 1 ||
++                   (input.num_planes == 2 && !e.import &&
++                    input.plane_fmt[1].bytesperline == input.plane_fmt[0].bytesperline)),
++              "unsupported encoder input layout");
++        e.input_planes = input.num_planes;
++        for (unsigned i = 0; i < e.input_planes; ++i)
++            e.plane_sizes[i] = input.plane_fmt[i].sizeimage;
++    }
+     e.stride = fmt.fmt.pix_mp.plane_fmt[0].bytesperline;
+     e.storage_height = fmt.fmt.pix_mp.height;
+     e.input_size = fmt.fmt.pix_mp.plane_fmt[0].sizeimage;
+@@ -626,7 +696,7 @@ Encoder::Encoder(const std::string &device, unsigned width, unsigned height, VAP
+         if (ret == 0 && !(tier.flags & V4L2_CTRL_FLAG_DISABLED))
+             e.control(tier.id, s.hevc_sequence.general_tier_flag);
+         else
+-            check(!s.hevc_sequence.general_tier_flag, "HEVC High tier requires Iris tier control",
++            check(!s.hevc_sequence.general_tier_flag, "HEVC High tier requires a tier control",
+                   VA_STATUS_ERROR_UNIMPLEMENTED);
+     } else {
+         e.control(V4L2_CID_MPEG_VIDEO_H264_PROFILE,
+@@ -640,8 +710,17 @@ Encoder::Encoder(const std::string &device, unsigned width, unsigned height, VAP
+     e.control(V4L2_CID_MPEG_VIDEO_B_FRAMES, 0);
+     // Keyframes follow VA picture requests; prevent autonomous periodic IDRs.
+     e.control(V4L2_CID_MPEG_VIDEO_GOP_SIZE, std::numeric_limits<int>::max());
+-    e.control(V4L2_CID_MPEG_VIDEO_HEADER_MODE, V4L2_MPEG_VIDEO_HEADER_MODE_JOINED_WITH_1ST_FRAME);
+-    e.control(V4L2_CID_MPEG_VIDEO_PREPEND_SPSPPS_TO_IDR, 1);
++    // Iris joins parameter sets to each IDR. Linlon implements neither control;
++    // refresh() then merges its separate parameter-set buffer into the first
++    // picture and repeats the cached sets before every later keyframe.
++    e.optional_control(V4L2_CID_MPEG_VIDEO_HEADER_MODE,
++                       V4L2_MPEG_VIDEO_HEADER_MODE_JOINED_WITH_1ST_FRAME);
++    e.emulate_prepend = !e.optional_control(V4L2_CID_MPEG_VIDEO_PREPEND_SPSPPS_TO_IDR, 1);
++    if (e.driver == CodecDriver::Mvx) {
++        // Annex B start codes ("Start codes" is menu index 1).
++        if (uint32_t nalu = find_control(e.fd, "nalu format"))
++            e.control(nalu, 1);
++    }
+     e.control(V4L2_CID_MPEG_VIDEO_FRAME_RC_ENABLE, s.rate_control != VA_RC_CQP);
+     if (s.rate_control != VA_RC_CQP) {
+         e.control(V4L2_CID_MPEG_VIDEO_BITRATE_MODE, s.rate_control == VA_RC_CBR
+@@ -653,7 +732,23 @@ Encoder::Encoder(const std::string &device, unsigned width, unsigned height, VAP
+     e.control(s.hevc ? V4L2_CID_MPEG_VIDEO_HEVC_MIN_QP : V4L2_CID_MPEG_VIDEO_H264_MIN_QP, s.min_qp);
+     e.control(s.hevc ? V4L2_CID_MPEG_VIDEO_HEVC_MAX_QP : V4L2_CID_MPEG_VIDEO_H264_MAX_QP, s.max_qp);
+     e.configure_deblocking();
+-    for (unsigned type : {CAPTURE, OUTPUT}) {
++    if (s.rate_control == VA_RC_CQP) {
++        // Configure the first picture's QP before the firmware starts: some
++        // drivers (Linlon) load the session at STREAMON with QP 0 otherwise.
++        int qp = s.hevc ? int(p.hevc_params.pic_init_qp) + p.hevc_slices.front().slice_qp_delta
++                        : int(p.params.pic_init_qp) + p.slices.front().slice_qp_delta;
++        if (qp >= 1 && qp <= 51) {
++            e.control(s.hevc ? V4L2_CID_MPEG_VIDEO_HEVC_I_FRAME_QP
++                             : V4L2_CID_MPEG_VIDEO_H264_I_FRAME_QP,
++                      qp);
++            e.control(s.hevc ? V4L2_CID_MPEG_VIDEO_HEVC_P_FRAME_QP
++                             : V4L2_CID_MPEG_VIDEO_H264_P_FRAME_QP,
++                      qp);
++            e.current_qp = qp;
++        }
++    }
++    // OUTPUT first: Linlon takes the rate from OUTPUT and only validates CAPTURE.
++    for (unsigned type : {OUTPUT, CAPTURE}) {
+         v4l2_streamparm parm{};
+         parm.type = type;
+         parm.parm.output.timeperframe.numerator = s.fps_den;
+@@ -668,11 +763,18 @@ Encoder::Encoder(const std::string &device, unsigned width, unsigned height, VAP
+     fmt.fmt.pix_mp.height = height;
+     fmt.fmt.pix_mp.pixelformat = s.hevc ? V4L2_PIX_FMT_HEVC : V4L2_PIX_FMT_H264;
+     checked(e.fd, VIDIOC_S_FMT, &fmt, "encoder refresh CAPTURE format");
++    unsigned input_buffers = 4;
++    {
++        v4l2_control minimum{};
++        minimum.id = V4L2_CID_MIN_BUFFERS_FOR_OUTPUT;
++        if (call(e.fd, VIDIOC_G_CTRL, &minimum) == 0 && minimum.value > 0)
++            input_buffers = std::min(16u, std::max(input_buffers, unsigned(minimum.value)));
++    }
+     for (unsigned type : {OUTPUT, CAPTURE}) {
+         v4l2_requestbuffers req{};
+         req.type = type;
+         req.memory = type == OUTPUT && e.import ? V4L2_MEMORY_DMABUF : V4L2_MEMORY_MMAP;
+-        req.count = 4;
++        req.count = type == OUTPUT ? input_buffers : 4;
+         checked(e.fd, VIDIOC_REQBUFS, &req, "encoder REQBUFS");
+         check(req.count && req.count <= 64, "invalid encoder buffer count");
+         if (type == OUTPUT) {
+@@ -681,26 +783,40 @@ Encoder::Encoder(const std::string &device, unsigned width, unsigned height, VAP
+                 continue;
+         }
+         for (unsigned i = 0; i < req.count; ++i) {
+-            QueueBuffer q(type, i);
++            const unsigned planes = type == OUTPUT ? e.input_planes : 1;
++            QueueBuffer q(type, i, false, planes);
+             checked(e.fd, VIDIOC_QUERYBUF, &q.buffer, "encoder QUERYBUF");
++            check(q.buffer.length == planes, "unexpected encoder buffer plane count");
+             auto m = std::make_shared<Memory>();
+             m->origin = MemoryOrigin::Iris;
++            m->index = i;
+             m->size = q.plane.length;
+-            void *ptr = mmap(nullptr, m->size, PROT_READ | PROT_WRITE, MAP_SHARED, e.fd,
+-                             q.plane.m.mem_offset);
+-            check(ptr != MAP_FAILED, "mmap encoder buffer");
+-            m->mapping = ptr;
++            if (planes == 1) {
++                void *ptr = mmap(nullptr, m->size, PROT_READ | PROT_WRITE, MAP_SHARED, e.fd,
++                                 q.plane.m.mem_offset);
++                check(ptr != MAP_FAILED, "mmap encoder buffer");
++                m->mapping = ptr;
++            }
+             if (type == OUTPUT) {
+                 m->stride = e.stride;
+                 m->storage_height = e.storage_height;
+                 m->width = e.width;
+                 m->height = e.height;
+-                v4l2_exportbuffer exp{};
+-                exp.type = OUTPUT;
+-                exp.index = i;
+-                exp.flags = O_CLOEXEC | O_RDWR;
+-                checked(e.fd, VIDIOC_EXPBUF, &exp, "encoder EXPBUF OUTPUT");
+-                m->fd = exp.fd;
++                // Split input is mapped through its exported DMA-BUFs.
++                for (unsigned p = 0; p < planes; ++p) {
++                    v4l2_exportbuffer exp{};
++                    exp.type = OUTPUT;
++                    exp.index = i;
++                    exp.plane = p;
++                    exp.flags = O_CLOEXEC | O_RDWR;
++                    checked(e.fd, VIDIOC_EXPBUF, &exp, "encoder EXPBUF OUTPUT");
++                    if (p) {
++                        m->chroma_fd = exp.fd;
++                        m->chroma_size = q.planes[p].length;
++                    } else {
++                        m->fd = exp.fd;
++                    }
++                }
+                 e.raw.push_back(m);
+             } else {
+                 e.capture.push_back(m);
+@@ -716,9 +832,10 @@ Encoder::Encoder(const std::string &device, unsigned width, unsigned height, VAP
+     type = CAPTURE;
+     checked(e.fd, VIDIOC_STREAMON, &type, "encoder STREAMON CAPTURE");
+     e.capture_on = true;
+-    trace("encoder %s %ux%u stride=%u storage-height=%u size=%u RC=%u queue=%s", device.c_str(),
+-          width, height, e.stride, e.storage_height, e.input_size, s.rate_control,
+-          e.import ? "dmabuf" : "mmap");
++    trace("encoder %s %ux%u stride=%u storage-height=%u size=%u planes=%u RC=%u queue=%s "
++          "prepend=%s",
++          device.c_str(), width, height, e.stride, e.storage_height, e.input_size, e.input_planes,
++          s.rate_control, e.import ? "dmabuf" : "mmap", e.emulate_prepend ? "emulated" : "driver");
+     impl_ = std::move(impl);
+ }
+ Encoder::~Encoder() = default;
+@@ -786,7 +903,11 @@ std::shared_ptr<EncodeTask> Encoder::encode(const EncodeSettings &s, const Encod
+     try {
+         // Scalar V4L2 controls have no per-request association. Drain before a
+         // QP change or forced IDR so they cannot affect an earlier queued frame.
+-        if ((s.rate_control == VA_RC_CQP && qp != e.current_qp) || (intra && e.token))
++        // Linlon flags a forced IDR on the input buffer itself, so only Iris
++        // (FORCE_KEY_FRAME control) needs a drain for keyframe requests.
++        const bool keyframe_control = e.driver != CodecDriver::Mvx;
++        if ((s.rate_control == VA_RC_CQP && qp != e.current_qp) ||
++            (intra && e.token && keyframe_control))
+             e.finish();
+         if (e.jobs.size() == e.input_count + e.capture.size()) {
+             auto task = e.jobs.begin()->second->task;
+@@ -857,13 +978,23 @@ std::shared_ptr<EncodeTask> Encoder::encode(const EncodeSettings &s, const Encod
+                       qp);
+             e.current_qp = qp;
+         }
+-        if (intra && e.token)
++        if (intra && e.token && keyframe_control)
+             e.control(V4L2_CID_MPEG_VIDEO_FORCE_KEY_FRAME, 0);
+-        QueueBuffer q(OUTPUT, index, e.import);
++        QueueBuffer q(OUTPUT, index, e.import, e.input_planes);
+         if (e.import)
+             q.plane.m.fd = memory->fd;
+-        q.plane.length = memory->size;
+-        q.plane.bytesused = e.input_size;
++        if (e.input_planes == 1) {
++            q.plane.length = memory->size;
++            q.plane.bytesused = e.input_size;
++        } else {
++            for (unsigned p = 0; p < e.input_planes; ++p) {
++                q.planes[p].length = p ? memory->chroma_size : memory->size;
++                q.planes[p].bytesused = e.plane_sizes[p];
++            }
++        }
++        // Linlon: KEYFRAME on a raw input buffer requests an IDR for it.
++        if (intra && e.token && !keyframe_control)
++            q.buffer.flags |= V4L2_BUF_FLAG_KEYFRAME;
+         const uint64_t token = e.token + 1;
+         q.buffer.timestamp.tv_sec = token / 1000000;
+         q.buffer.timestamp.tv_usec = token % 1000000;
+diff --git a/src/gpu-copy.cpp b/src/gpu-copy.cpp
+index 1120d3a..803e861 100644
+--- a/src/gpu-copy.cpp
++++ b/src/gpu-copy.cpp
+@@ -29,12 +29,15 @@ class GpuCopy {
+         GpuCopy &owner;
+         std::weak_ptr<Memory> memory;
+         unsigned width, height, stride, storage_height, offset, fourcc;
++        int fds[2];
++        uint64_t chroma_offset;
+         EGLImageKHR images[2] = {EGL_NO_IMAGE_KHR, EGL_NO_IMAGE_KHR};
+         GLuint textures[2] = {};
+         unsigned columns[2] = {}, rows[2] = {};
+         View(GpuCopy &gpu, const std::shared_ptr<Memory> &m, unsigned w, unsigned h)
+             : owner(gpu), memory(m), width(w), height(h), stride(m->stride),
+-              storage_height(m->storage_height), offset(m->data_offset), fourcc(m->fourcc) {}
++              storage_height(m->storage_height), offset(m->data_offset), fourcc(m->fourcc),
++              fds{m->fd, m->chroma_object_fd()}, chroma_offset(m->chroma_object_offset()) {}
+         ~View() {
+             glDeleteTextures(2, textures);
+             for (auto image : images)
+@@ -44,15 +47,23 @@ class GpuCopy {
+         bool matches(const std::shared_ptr<Memory> &m, unsigned w, unsigned h) const {
+             return memory.lock() == m && width == w && height == h && stride == m->stride &&
+                    storage_height == m->storage_height && offset == m->data_offset &&
+-                   fourcc == m->fourcc;
++                   fourcc == m->fourcc && fds[0] == m->fd && fds[1] == m->chroma_object_fd() &&
++                   chroma_offset == m->chroma_object_offset();
+         }
+     };
+     // Weak ownership is essential: retaining CAPTURE Memory would prevent requeue().
+     std::map<Memory *, std::unique_ptr<View>> views_;
++    // glCopyImageSubData is core in GLES 3.2 only. Mali-G720 on Panfrost
++    // exposes GLES 3.1, where the copy uses EXT/OES_copy_image or, failing
++    // that, a nearest-filter framebuffer blit (exact for RGBA8 texels).
++    PFNGLCOPYIMAGESUBDATAPROC copy_image_ = nullptr;
++    GLuint framebuffers_[2] = {};
+     void cleanup() noexcept {
+         if (context_ != EGL_NO_CONTEXT) {
+             glFinish();
+             views_.clear();
++            if (framebuffers_[0])
++                glDeleteFramebuffers(2, framebuffers_);
+             eglMakeCurrent(display_, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+             eglDestroyContext(display_, context_);
+         }
+@@ -80,9 +91,11 @@ class GpuCopy {
+             // RGBA8 views transport four raw bytes per texel; no YUV conversion.
+             uint64_t row_bytes = uint64_t(p ? ((w + 1) & ~1u) : w) * bytes;
+             unsigned columns = (row_bytes + 3) / 4, rows = p ? (h + 1) / 2 : h;
+-            uint64_t offset = m->data_offset + (p ? uint64_t(m->stride) * m->storage_height : 0);
++            uint64_t offset = p ? m->chroma_object_offset() : m->data_offset;
++            uint64_t object_size = p ? m->chroma_object_size() : m->size;
+             check(uint64_t(columns) * 4 <= m->stride && offset <= INT_MAX &&
+-                      offset + uint64_t(rows - 1) * m->stride + uint64_t(columns) * 4 <= m->size,
++                      offset + uint64_t(rows - 1) * m->stride + uint64_t(columns) * 4 <=
++                          object_size,
+                   "GPU copy packed plane exceeds buffer");
+             EGLint attributes[] = {EGL_WIDTH,
+                                    EGLint(columns),
+@@ -91,7 +104,7 @@ class GpuCopy {
+                                    EGL_LINUX_DRM_FOURCC_EXT,
+                                    DRM_FORMAT_ABGR8888,
+                                    EGL_DMA_BUF_PLANE0_FD_EXT,
+-                                   m->fd,
++                                   v->fds[p],
+                                    EGL_DMA_BUF_PLANE0_OFFSET_EXT,
+                                    EGLint(offset),
+                                    EGL_DMA_BUF_PLANE0_PITCH_EXT,
+@@ -117,12 +130,24 @@ class GpuCopy {
+             v->columns[p] = columns;
+             v->rows[p] = rows;
+         }
+-        trace("GPU copy imported buffer=%p %ux%u offset=%u", static_cast<void *>(m.get()), w, h,
+-              m->data_offset);
++        trace("GPU copy imported buffer=%p %ux%u offset=%u split=%d", static_cast<void *>(m.get()),
++              w, h, m->data_offset, int(m->split()));
+         auto &result = *v;
+         views_.emplace(m.get(), std::move(v));
+         return result;
+     }
++    void blit(GLuint source, GLuint destination, unsigned columns, unsigned rows) {
++        glBindFramebuffer(GL_READ_FRAMEBUFFER, framebuffers_[0]);
++        glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, source, 0);
++        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, framebuffers_[1]);
++        glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
++                               destination, 0);
++        check(glCheckFramebufferStatus(GL_READ_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE &&
++                  glCheckFramebufferStatus(GL_DRAW_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE,
++              "GPU copy framebuffer incomplete; try IRIS_VAAPI_COPY=cpu");
++        glBlitFramebuffer(0, 0, GLint(columns), GLint(rows), 0, 0, GLint(columns), GLint(rows),
++                          GL_COLOR_BUFFER_BIT, GL_NEAREST);
++    }
+ 
+   public:
+     explicit GpuCopy(int render_fd) {
+@@ -149,18 +174,37 @@ class GpuCopy {
+                   "GPU copy EGL initialize failed");
+             initialized_ = true;
+             check(eglBindAPI(EGL_OPENGL_ES_API), "GPU copy EGL bind API failed");
+-            EGLint attributes[] = {EGL_CONTEXT_MAJOR_VERSION_KHR, 3, EGL_CONTEXT_MINOR_VERSION_KHR,
+-                                   2, EGL_NONE};
+-            context_ = eglCreateContext(display_, EGL_NO_CONFIG_KHR, EGL_NO_CONTEXT, attributes);
++            // Prefer GLES 3.2 (Adreno); Panfrost on Mali-G720 stops at 3.1.
++            int minor = 2;
++            for (; minor >= 0 && context_ == EGL_NO_CONTEXT; --minor) {
++                EGLint attributes[] = {EGL_CONTEXT_MAJOR_VERSION_KHR, 3,
++                                       EGL_CONTEXT_MINOR_VERSION_KHR, minor, EGL_NONE};
++                context_ =
++                    eglCreateContext(display_, EGL_NO_CONFIG_KHR, EGL_NO_CONTEXT, attributes);
++            }
++            ++minor;
+             check(context_ != EGL_NO_CONTEXT &&
+                       eglMakeCurrent(display_, EGL_NO_SURFACE, EGL_NO_SURFACE, context_),
+-                  "GPU copy GLES 3.2 context failed");
++                  "GPU copy GLES 3 context failed");
+             auto renderer = reinterpret_cast<const char *>(glGetString(GL_RENDERER));
+             check(renderer && !strstr(renderer, "llvmpipe") && !strstr(renderer, "softpipe") &&
+                       !strstr(renderer, "Software"),
+                   "GPU copy requires hardware rendering");
+-            trace("GPU copy initialized renderer=%s (private GBM display, worker thread)",
+-                  renderer);
++            auto extensions = reinterpret_cast<const char *>(glGetString(GL_EXTENSIONS));
++            auto has = [&](const char *name) { return extensions && strstr(extensions, name); };
++            const char *entry = minor >= 2                 ? "glCopyImageSubData"
++                                : has("GL_EXT_copy_image") ? "glCopyImageSubDataEXT"
++                                : has("GL_OES_copy_image") ? "glCopyImageSubDataOES"
++                                                           : nullptr;
++            if (entry)
++                copy_image_ = reinterpret_cast<PFNGLCOPYIMAGESUBDATAPROC>(eglGetProcAddress(entry));
++            if (!copy_image_) {
++                glGenFramebuffers(2, framebuffers_);
++                check(glGetError() == GL_NO_ERROR, "GPU copy framebuffer setup failed");
++            }
++            trace("GPU copy initialized renderer=%s GLES 3.%d copy=%s (private GBM display, "
++                  "worker thread)",
++                  renderer, minor, copy_image_ ? entry : "blit");
+         } catch (...) {
+             cleanup();
+             throw;
+@@ -183,9 +227,13 @@ class GpuCopy {
+         wait_surface_access(*src, POLLIN);
+         wait_surface_access(*dst, POLLOUT);
+         auto &s = view(src, w, h), &d = view(dst, w, h);
+-        for (unsigned p = 0; p < 2; ++p)
+-            glCopyImageSubData(s.textures[p], GL_TEXTURE_2D, 0, 0, 0, 0, d.textures[p],
+-                               GL_TEXTURE_2D, 0, 0, 0, 0, s.columns[p], s.rows[p], 1);
++        for (unsigned p = 0; p < 2; ++p) {
++            if (copy_image_)
++                copy_image_(s.textures[p], GL_TEXTURE_2D, 0, 0, 0, 0, d.textures[p], GL_TEXTURE_2D,
++                            0, 0, 0, 0, s.columns[p], s.rows[p], 1);
++            else
++                blit(s.textures[p], d.textures[p], s.columns[p], s.rows[p]);
++        }
+         // The persistent export consumer may render without another VA sync call.
+         glFinish();
+         check(glGetError() == GL_NO_ERROR, "GPU copy failed; try IRIS_VAAPI_COPY=cpu");
+diff --git a/src/internal.hpp b/src/internal.hpp
+index f1f44f3..137f38d 100644
+--- a/src/internal.hpp
++++ b/src/internal.hpp
+@@ -21,9 +21,11 @@
+ #include <cstdio>
+ #include <cstdlib>
+ #include <atomic>
++#include <cstddef>
+ #include <type_traits>
+ 
+ extern "C" int irisva_msm_allocate(int drm_fd, uint64_t size, int *coherent);
++extern "C" int irisva_drm_is_msm(int drm_fd);
+ 
+ namespace irisva {
+ struct Error : std::runtime_error {
+@@ -44,18 +46,78 @@ template <class... A> void trace(const char *f, A... a) {
+         std::fprintf(stderr, "\n");
+     }
+ }
+-enum class MemoryOrigin { Unknown, MsmWriteCombined, MsmCoherent, DmaHeap, Imported, Iris };
++// Iris: storage owned by the V4L2 codec driver (Iris or Arm Linlon "mvx").
++// Such buffers may still be decoder references and are never written by VA.
++enum class MemoryOrigin {
++    Unknown,
++    MsmWriteCombined,
++    MsmCoherent,
++    DmaHeap,
++    Imported,
++    Iris,
++    Udmabuf,
++    Gbm
++};
++inline bool independent_storage(MemoryOrigin origin) {
++    return origin == MemoryOrigin::MsmCoherent || origin == MemoryOrigin::MsmWriteCombined ||
++           origin == MemoryOrigin::DmaHeap || origin == MemoryOrigin::Imported ||
++           origin == MemoryOrigin::Udmabuf || origin == MemoryOrigin::Gbm;
++}
++// A semi-planar NV12/P010 picture. The luma plane starts at data_offset in
++// fd. The chroma plane either follows in the same object, at
++// data_offset + stride * storage_height (Iris, VA allocations), or lives in
++// a second DMA-BUF (chroma_fd, chroma_offset): Arm Linlon reports NV12/P010
++// as two discrete V4L2 planes. Both planes always share one stride.
+ struct Memory {
+     std::shared_ptr<void> fastcv_registration;
+     MemoryOrigin origin = MemoryOrigin::Unknown;
+     int fd = -1;
+     void *mapping = nullptr;
+     size_t size = 0;
++    int chroma_fd = -1;
++    size_t chroma_size = 0;
++    unsigned chroma_offset = 0;
+     unsigned index = 0, stride = 0, storage_height = 0, width = 0, height = 0;
+     unsigned data_offset = 0, fourcc = VA_FOURCC_NV12;
+     bool queued = false;
+     ~Memory();
++    bool split() const {
++        return chroma_fd >= 0;
++    }
++    // CPU mapping of both planes. Split buffers are mapped back to back,
++    // the chroma object starting at the page-aligned end of the luma object.
+     uint8_t *map();
++    size_t mapping_size() const;
++    // Chroma plane offset inside map().
++    size_t chroma_mapping_offset() const;
++    // DMA-BUF and offset holding the chroma plane.
++    int chroma_object_fd() const {
++        return split() ? chroma_fd : fd;
++    }
++    uint64_t chroma_object_offset() const {
++        return split() ? uint64_t(chroma_offset)
++                       : uint64_t(data_offset) + uint64_t(stride) * storage_height;
++    }
++    size_t chroma_object_size() const {
++        return split() ? chroma_size : size;
++    }
++    // DMA_BUF_IOCTL_SYNC on every object; returns false on failure.
++    bool sync(uint64_t flags) const;
++};
++// Linear, CPU-mappable storage for surfaces that are not decoder output.
++// Allocation order: MSM GEM (Qualcomm), the system DMA heap, udmabuf, then
++// a linear GBM buffer on the VA render node (Panthor and other Mesa GPUs).
++class Allocator {
++    struct Gbm;
++    int render_fd_;
++    bool msm_;
++    std::unique_ptr<Gbm> gbm_;
++    bool gbm_failed_ = false;
++
++  public:
++    explicit Allocator(int render_fd);
++    ~Allocator();
++    std::shared_ptr<Memory> allocate(unsigned width, unsigned height, unsigned fourcc);
+ };
+ class Decoder;
+ class SurfaceCopier {
+@@ -162,18 +224,32 @@ std::vector<uint8_t> h264_bitstream(VAProfile profile, const Picture &picture, H
+ std::vector<uint8_t> hevc_bitstream(VAProfile profile, const HevcPicture &picture,
+                                     HevcState &state);
+ 
++enum class CodecDriver { Unknown, Iris, Mvx };
++// V4L2 QUERYCAP driver name of an open video node.
++CodecDriver codec_driver(int fd);
++// Finds a stateful M2M node: H.264 on OUTPUT (decoder) or CAPTURE (encoder).
++// The first environment variable which is set overrides discovery.
++std::string find_codec_device(bool encoder, const char *const *environment);
++// Finds a V4L2 control by its driver-specific name; 0 if absent.
++uint32_t find_control(int fd, const char *name);
++
+ class Decoder {
+     int fd_ = -1;
+     FILE *dump_ = nullptr;
+     std::mutex mutex_;
++    CodecDriver driver_ = CodecDriver::Unknown;
+     bool output_on_ = false, capture_on_ = false;
+     bool source_change_ = false, last_ = false;
++    unsigned capture_planes_ = 1, capture_bytesperline_ = 0;
+     unsigned width_, height_, pool_size_, fourcc_;
+     uint64_t next_token_ = 1;
+     std::vector<std::shared_ptr<Memory>> output_, capture_;
+     std::map<uint64_t, std::shared_ptr<Surface>> pending_;
+     SurfaceCopier copier_;
+-    void allocate(unsigned type, unsigned count, std::vector<std::shared_ptr<Memory>> &pool);
++    void allocate(unsigned type, unsigned count, unsigned planes,
++                  std::vector<std::shared_ptr<Memory>> &pool);
++    void configure_decode_order(VAProfile profile);
++    bool capture_format_unchanged();
+     void configure_capture();
+     void pump(int timeout_ms);
+     void requeue();
+@@ -270,6 +346,7 @@ struct Driver {
+     std::recursive_mutex mutex;
+     std::string device;
+     std::string encoder_device;
++    std::unique_ptr<Allocator> allocator;
+     uint32_t next_id = 1;
+     std::map<uint32_t, Config> configs;
+     std::map<uint32_t, std::shared_ptr<Context>> contexts;
+diff --git a/src/msm.c b/src/msm.c
+index eedb759..c2f346b 100644
+--- a/src/msm.c
++++ b/src/msm.c
+@@ -1,6 +1,7 @@
+ // SPDX-License-Identifier: MIT
+ // Keep the MSM uAPI in C: older libdrm headers use the C++ keyword "or".
+ #include <stdint.h>
++#include <string.h>
+ #include <errno.h>
+ #include <fcntl.h>
+ #include <unistd.h>
+@@ -12,8 +13,16 @@
+ #define MSM_BO_CACHED_COHERENT 0x080000
+ #endif
+ 
++int irisva_drm_is_msm(int drm_fd);
++
+ int irisva_msm_allocate(int drm_fd, uint64_t size, int *coherent) {
+     *coherent = 0;
++    // MSM ioctl numbers are driver-private: on another DRM driver (Panthor on
++    // CIX Sky1, for example) the same number selects an unrelated ioctl.
++    if (!irisva_drm_is_msm(drm_fd)) {
++        errno = ENODEV;
++        return -1;
++    }
+     struct drm_msm_gem_new allocation = {.size = size, .flags = MSM_BO_CACHED_COHERENT};
+     if (drmIoctl(drm_fd, DRM_IOCTL_MSM_GEM_NEW, &allocation) < 0) {
+         // Unsupported cache modes return EINVAL. Do not hide allocation or
+@@ -40,3 +49,12 @@ int irisva_msm_allocate(int drm_fd, uint64_t size, int *coherent) {
+     *coherent = allocation.flags == MSM_BO_CACHED_COHERENT;
+     return prime_fd;
+ }
++
++int irisva_drm_is_msm(int drm_fd) {
++    drmVersionPtr version = drmGetVersion(drm_fd);
++    if (!version)
++        return 0;
++    int msm = version->name && !strcmp(version->name, "msm");
++    drmFreeVersion(version);
++    return msm;
++}
+diff --git a/src/surface-copy.cpp b/src/surface-copy.cpp
+index 962d058..157058c 100644
+--- a/src/surface-copy.cpp
++++ b/src/surface-copy.cpp
+@@ -6,9 +6,9 @@
+ #include <cerrno>
+ 
+ namespace irisva {
+-void wait_surface_access(const Memory &memory, short events) {
+-    auto start = std::chrono::steady_clock::now();
+-    pollfd fence{memory.fd, events, 0};
++namespace {
++void wait_object(int fd, short events, std::chrono::steady_clock::time_point start) {
++    pollfd fence{fd, events, 0};
+     for (;;) {
+         int result = poll(&fence, 1, 100);
+         if (result < 0 && errno == EINTR)
+@@ -21,15 +21,14 @@ void wait_surface_access(const Memory &memory, short events) {
+               "persistent surface DMA-BUF fence timeout", VA_STATUS_ERROR_TIMEDOUT);
+     }
+ }
+-namespace {
+-int sync_ioctl(int fd, uint64_t flags) {
+-    dma_buf_sync sync{flags};
+-    int result;
+-    do {
+-        result = ioctl(fd, DMA_BUF_IOCTL_SYNC, &sync);
+-    } while (result < 0 && errno == EINTR);
+-    return result;
++} // namespace
++void wait_surface_access(const Memory &memory, short events) {
++    auto start = std::chrono::steady_clock::now();
++    wait_object(memory.fd, events, start);
++    if (memory.split())
++        wait_object(memory.chroma_fd, events, start);
+ }
++namespace {
+ struct CpuAccess {
+     Memory &memory;
+     uint64_t access;
+@@ -38,29 +37,29 @@ struct CpuAccess {
+         // DMA_BUF_IOCTL_SYNC maintains CPU cache coherency, not exclusion
+         // against an outstanding GPU reader of a recycled exported surface.
+         wait_surface_access(memory, flags & DMA_BUF_SYNC_WRITE ? POLLOUT : POLLIN);
+-        check(sync_ioctl(memory.fd, DMA_BUF_SYNC_START | access) == 0,
+-              "persistent surface DMA-BUF access failed");
++        check(memory.sync(DMA_BUF_SYNC_START | access), "persistent surface DMA-BUF access failed");
+         active = true;
+     }
+     void finish() {
+         if (!active)
+             return;
+-        check(sync_ioctl(memory.fd, DMA_BUF_SYNC_END | access) == 0,
+-              "persistent surface DMA-BUF access end failed");
+         active = false;
++        check(memory.sync(DMA_BUF_SYNC_END | access),
++              "persistent surface DMA-BUF access end failed");
+     }
+     ~CpuAccess() {
+         if (active)
+-            sync_ioctl(memory.fd, DMA_BUF_SYNC_END | access);
++            memory.sync(DMA_BUF_SYNC_END | access);
+     }
+ };
+ void validate(const Memory &m, unsigned width, unsigned height, unsigned bytes) {
+-    const uint64_t chroma_offset = uint64_t(m.data_offset) + uint64_t(m.stride) * m.storage_height;
+     const uint64_t chroma_rows = (height + 1) / 2;
+     const uint64_t row_bytes = uint64_t((width + 1) & ~1u) * bytes;
+     check(width && height && width <= m.width && height <= m.height && height <= m.storage_height &&
+               row_bytes <= m.stride &&
+-              chroma_offset + (chroma_rows - 1) * m.stride + row_bytes <= m.size,
++              uint64_t(m.data_offset) + uint64_t(height - 1) * m.stride + row_bytes <= m.size &&
++              m.chroma_object_offset() + (chroma_rows - 1) * m.stride + row_bytes <=
++                  m.chroma_object_size(),
+           "persistent surface copy exceeds buffer layout", VA_STATUS_ERROR_INVALID_SURFACE);
+ }
+ } // namespace
+@@ -77,12 +76,16 @@ void copy_surface(Memory &destination, Memory &source, unsigned width, unsigned
+     CpuAccess read(source, DMA_BUF_SYNC_READ);
+     CpuAccess write(destination, DMA_BUF_SYNC_WRITE);
+     for (unsigned plane = 0; plane < 2; ++plane) {
+-        size_t src_offset =
+-            source.data_offset + (plane ? size_t(source.stride) * source.storage_height : 0);
+-        size_t dst_offset = destination.data_offset +
+-                            (plane ? size_t(destination.stride) * destination.storage_height : 0);
++        size_t src_offset = plane ? source.chroma_mapping_offset() : source.data_offset;
++        size_t dst_offset = plane ? destination.chroma_mapping_offset() : destination.data_offset;
+         unsigned rows = plane ? (height + 1) / 2 : height;
+         unsigned row_bytes = (plane ? ((width + 1) & ~1u) : width) * bytes;
++        if (source.stride == destination.stride && row_bytes + 128 >= source.stride) {
++            // Identical pitches: one large copy is faster than per-row calls.
++            std::memcpy(dst + dst_offset, src + src_offset,
++                        size_t(rows - 1) * source.stride + row_bytes);
++            continue;
++        }
+         for (unsigned row = 0; row < rows; ++row)
+             std::memcpy(dst + dst_offset + size_t(row) * destination.stride,
+                         src + src_offset + size_t(row) * source.stride, row_bytes);

@@ -29,12 +29,15 @@ class GpuCopy {
         GpuCopy &owner;
         std::weak_ptr<Memory> memory;
         unsigned width, height, stride, storage_height, offset, fourcc;
+        int fds[2];
+        uint64_t chroma_offset;
         EGLImageKHR images[2] = {EGL_NO_IMAGE_KHR, EGL_NO_IMAGE_KHR};
         GLuint textures[2] = {};
         unsigned columns[2] = {}, rows[2] = {};
         View(GpuCopy &gpu, const std::shared_ptr<Memory> &m, unsigned w, unsigned h)
             : owner(gpu), memory(m), width(w), height(h), stride(m->stride),
-              storage_height(m->storage_height), offset(m->data_offset), fourcc(m->fourcc) {}
+              storage_height(m->storage_height), offset(m->data_offset), fourcc(m->fourcc),
+              fds{m->fd, m->chroma_object_fd()}, chroma_offset(m->chroma_object_offset()) {}
         ~View() {
             glDeleteTextures(2, textures);
             for (auto image : images)
@@ -44,15 +47,23 @@ class GpuCopy {
         bool matches(const std::shared_ptr<Memory> &m, unsigned w, unsigned h) const {
             return memory.lock() == m && width == w && height == h && stride == m->stride &&
                    storage_height == m->storage_height && offset == m->data_offset &&
-                   fourcc == m->fourcc;
+                   fourcc == m->fourcc && fds[0] == m->fd && fds[1] == m->chroma_object_fd() &&
+                   chroma_offset == m->chroma_object_offset();
         }
     };
     // Weak ownership is essential: retaining CAPTURE Memory would prevent requeue().
     std::map<Memory *, std::unique_ptr<View>> views_;
+    // glCopyImageSubData is core in GLES 3.2 only. Mali-G720 on Panfrost
+    // exposes GLES 3.1, where the copy uses EXT/OES_copy_image or, failing
+    // that, a nearest-filter framebuffer blit (exact for RGBA8 texels).
+    PFNGLCOPYIMAGESUBDATAPROC copy_image_ = nullptr;
+    GLuint framebuffers_[2] = {};
     void cleanup() noexcept {
         if (context_ != EGL_NO_CONTEXT) {
             glFinish();
             views_.clear();
+            if (framebuffers_[0])
+                glDeleteFramebuffers(2, framebuffers_);
             eglMakeCurrent(display_, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
             eglDestroyContext(display_, context_);
         }
@@ -80,9 +91,11 @@ class GpuCopy {
             // RGBA8 views transport four raw bytes per texel; no YUV conversion.
             uint64_t row_bytes = uint64_t(p ? ((w + 1) & ~1u) : w) * bytes;
             unsigned columns = (row_bytes + 3) / 4, rows = p ? (h + 1) / 2 : h;
-            uint64_t offset = m->data_offset + (p ? uint64_t(m->stride) * m->storage_height : 0);
+            uint64_t offset = p ? m->chroma_object_offset() : m->data_offset;
+            uint64_t object_size = p ? m->chroma_object_size() : m->size;
             check(uint64_t(columns) * 4 <= m->stride && offset <= INT_MAX &&
-                      offset + uint64_t(rows - 1) * m->stride + uint64_t(columns) * 4 <= m->size,
+                      offset + uint64_t(rows - 1) * m->stride + uint64_t(columns) * 4 <=
+                          object_size,
                   "GPU copy packed plane exceeds buffer");
             EGLint attributes[] = {EGL_WIDTH,
                                    EGLint(columns),
@@ -91,7 +104,7 @@ class GpuCopy {
                                    EGL_LINUX_DRM_FOURCC_EXT,
                                    DRM_FORMAT_ABGR8888,
                                    EGL_DMA_BUF_PLANE0_FD_EXT,
-                                   m->fd,
+                                   v->fds[p],
                                    EGL_DMA_BUF_PLANE0_OFFSET_EXT,
                                    EGLint(offset),
                                    EGL_DMA_BUF_PLANE0_PITCH_EXT,
@@ -117,11 +130,23 @@ class GpuCopy {
             v->columns[p] = columns;
             v->rows[p] = rows;
         }
-        trace("GPU copy imported buffer=%p %ux%u offset=%u", static_cast<void *>(m.get()), w, h,
-              m->data_offset);
+        trace("GPU copy imported buffer=%p %ux%u offset=%u split=%d", static_cast<void *>(m.get()),
+              w, h, m->data_offset, int(m->split()));
         auto &result = *v;
         views_.emplace(m.get(), std::move(v));
         return result;
+    }
+    void blit(GLuint source, GLuint destination, unsigned columns, unsigned rows) {
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, framebuffers_[0]);
+        glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, source, 0);
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, framebuffers_[1]);
+        glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
+                               destination, 0);
+        check(glCheckFramebufferStatus(GL_READ_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE &&
+                  glCheckFramebufferStatus(GL_DRAW_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE,
+              "GPU copy framebuffer incomplete; try IRIS_VAAPI_COPY=cpu");
+        glBlitFramebuffer(0, 0, GLint(columns), GLint(rows), 0, 0, GLint(columns), GLint(rows),
+                          GL_COLOR_BUFFER_BIT, GL_NEAREST);
     }
 
   public:
@@ -149,18 +174,37 @@ class GpuCopy {
                   "GPU copy EGL initialize failed");
             initialized_ = true;
             check(eglBindAPI(EGL_OPENGL_ES_API), "GPU copy EGL bind API failed");
-            EGLint attributes[] = {EGL_CONTEXT_MAJOR_VERSION_KHR, 3, EGL_CONTEXT_MINOR_VERSION_KHR,
-                                   2, EGL_NONE};
-            context_ = eglCreateContext(display_, EGL_NO_CONFIG_KHR, EGL_NO_CONTEXT, attributes);
+            // Prefer GLES 3.2 (Adreno); Panfrost on Mali-G720 stops at 3.1.
+            int minor = 2;
+            for (; minor >= 0 && context_ == EGL_NO_CONTEXT; --minor) {
+                EGLint attributes[] = {EGL_CONTEXT_MAJOR_VERSION_KHR, 3,
+                                       EGL_CONTEXT_MINOR_VERSION_KHR, minor, EGL_NONE};
+                context_ =
+                    eglCreateContext(display_, EGL_NO_CONFIG_KHR, EGL_NO_CONTEXT, attributes);
+            }
+            ++minor;
             check(context_ != EGL_NO_CONTEXT &&
                       eglMakeCurrent(display_, EGL_NO_SURFACE, EGL_NO_SURFACE, context_),
-                  "GPU copy GLES 3.2 context failed");
+                  "GPU copy GLES 3 context failed");
             auto renderer = reinterpret_cast<const char *>(glGetString(GL_RENDERER));
             check(renderer && !strstr(renderer, "llvmpipe") && !strstr(renderer, "softpipe") &&
                       !strstr(renderer, "Software"),
                   "GPU copy requires hardware rendering");
-            trace("GPU copy initialized renderer=%s (private GBM display, worker thread)",
-                  renderer);
+            auto extensions = reinterpret_cast<const char *>(glGetString(GL_EXTENSIONS));
+            auto has = [&](const char *name) { return extensions && strstr(extensions, name); };
+            const char *entry = minor >= 2                 ? "glCopyImageSubData"
+                                : has("GL_EXT_copy_image") ? "glCopyImageSubDataEXT"
+                                : has("GL_OES_copy_image") ? "glCopyImageSubDataOES"
+                                                           : nullptr;
+            if (entry)
+                copy_image_ = reinterpret_cast<PFNGLCOPYIMAGESUBDATAPROC>(eglGetProcAddress(entry));
+            if (!copy_image_) {
+                glGenFramebuffers(2, framebuffers_);
+                check(glGetError() == GL_NO_ERROR, "GPU copy framebuffer setup failed");
+            }
+            trace("GPU copy initialized renderer=%s GLES 3.%d copy=%s (private GBM display, "
+                  "worker thread)",
+                  renderer, minor, copy_image_ ? entry : "blit");
         } catch (...) {
             cleanup();
             throw;
@@ -183,9 +227,13 @@ class GpuCopy {
         wait_surface_access(*src, POLLIN);
         wait_surface_access(*dst, POLLOUT);
         auto &s = view(src, w, h), &d = view(dst, w, h);
-        for (unsigned p = 0; p < 2; ++p)
-            glCopyImageSubData(s.textures[p], GL_TEXTURE_2D, 0, 0, 0, 0, d.textures[p],
-                               GL_TEXTURE_2D, 0, 0, 0, 0, s.columns[p], s.rows[p], 1);
+        for (unsigned p = 0; p < 2; ++p) {
+            if (copy_image_)
+                copy_image_(s.textures[p], GL_TEXTURE_2D, 0, 0, 0, 0, d.textures[p], GL_TEXTURE_2D,
+                            0, 0, 0, 0, s.columns[p], s.rows[p], 1);
+            else
+                blit(s.textures[p], d.textures[p], s.columns[p], s.rows[p]);
+        }
         // The persistent export consumer may render without another VA sync call.
         glFinish();
         check(glGetError() == GL_NO_ERROR, "GPU copy failed; try IRIS_VAAPI_COPY=cpu");

@@ -26,17 +26,56 @@ void checked(int fd, unsigned long command, void *arg, const char *name) {
     if (call(fd, command, arg) < 0)
         throw Error(VA_STATUS_ERROR_ENCODING_ERROR, std::string(name) + ": " + strerror(errno));
 }
+// The plane count must match the queue: Linlon describes NV12 input as two
+// discrete planes, Iris as one. Coded CAPTURE buffers always have one plane.
 struct QueueBuffer {
-    v4l2_plane plane{};
+    v4l2_plane planes[VIDEO_MAX_PLANES]{};
+    v4l2_plane &plane = planes[0];
     v4l2_buffer buffer{};
-    explicit QueueBuffer(unsigned type, unsigned index = 0, bool import = false) {
+    explicit QueueBuffer(unsigned type, unsigned index = 0, bool import = false,
+                         unsigned count = 1) {
         buffer.type = type;
         buffer.index = index;
         buffer.memory = type == OUTPUT && import ? V4L2_MEMORY_DMABUF : V4L2_MEMORY_MMAP;
-        buffer.length = 1;
-        buffer.m.planes = &plane;
+        buffer.length = count;
+        buffer.m.planes = planes;
     }
+    QueueBuffer(const QueueBuffer &) = delete;
+    QueueBuffer &operator=(const QueueBuffer &) = delete;
 };
+bool parameter_set(unsigned type, bool hevc) {
+    return hevc ? type == 32 || type == 33 || type == 34 : type == 7 || type == 8;
+}
+bool vcl(unsigned type, bool hevc) {
+    return hevc ? type < 32 : type >= 1 && type <= 5;
+}
+bool random_access(unsigned type, bool hevc) {
+    return hevc ? type >= 16 && type <= 21 : type == 5;
+}
+// Annex B prefix of a coded buffer, scanned only up to its first slice:
+// parameter sets always precede the VCL NAL units they apply to.
+struct NalPrefix {
+    bool parameters = false, slice = false, random_access = false;
+    size_t first_slice = 0; // Start-code offset of the first VCL NAL unit.
+};
+NalPrefix scan_prefix(const uint8_t *data, size_t size, bool hevc) {
+    NalPrefix result;
+    result.first_slice = size;
+    for (size_t i = 0; i + 3 < size; ++i) {
+        if (data[i] || data[i + 1] || data[i + 2] != 1)
+            continue;
+        const unsigned type = hevc ? (data[i + 3] >> 1) & 63 : data[i + 3] & 31;
+        result.parameters |= parameter_set(type, hevc);
+        if (vcl(type, hevc)) {
+            result.slice = true;
+            result.random_access = random_access(type, hevc);
+            result.first_slice = i && !data[i - 1] ? i - 1 : i;
+            break;
+        }
+        i += 2;
+    }
+    return result;
+}
 template <class T> T parameter(const Buffer &b, size_t offset = 0) {
     check(b.elements == 1 && b.data.size() >= offset + sizeof(T), "short encode parameter buffer",
           VA_STATUS_ERROR_INVALID_BUFFER);
@@ -189,38 +228,9 @@ void validate(const EncodeSettings &s, const EncodePicture &p, unsigned width, u
 } // namespace
 
 std::string find_encoder_device() {
-    std::vector<std::string> paths;
-    if (const char *p = std::getenv("IRIS_VAAPI_ENCODER_DEVICE"))
-        paths.emplace_back(p);
-    else {
-        glob_t g{};
-        if (!glob("/dev/video*", 0, nullptr, &g))
-            for (size_t i = 0; i < g.gl_pathc; ++i)
-                paths.emplace_back(g.gl_pathv[i]);
-        globfree(&g);
-    }
-    for (const auto &path : paths) {
-        int fd = open(path.c_str(), O_RDWR | O_NONBLOCK | O_CLOEXEC);
-        if (fd < 0)
-            continue;
-        v4l2_capability cap{};
-        bool match = false;
-        if (!call(fd, VIDIOC_QUERYCAP, &cap) &&
-            !strcmp(reinterpret_cast<char *>(cap.driver), "iris_driver") &&
-            (cap.device_caps & V4L2_CAP_VIDEO_M2M_MPLANE)) {
-            v4l2_fmtdesc fmt{};
-            fmt.type = CAPTURE;
-            while (!call(fd, VIDIOC_ENUM_FMT, &fmt)) {
-                if (fmt.pixelformat == V4L2_PIX_FMT_H264)
-                    match = true;
-                ++fmt.index;
-            }
-        }
-        close(fd);
-        if (match)
-            return path;
-    }
-    return {};
+    static const char *const environment[] = {"LIBVA_V4L2_ENCODER_DEVICE",
+                                              "IRIS_VAAPI_ENCODER_DEVICE", nullptr};
+    return find_codec_device(true, environment);
 }
 
 void render_encode_buffer(EncodeSettings &s, EncodePicture &p, const Buffer &b) {
@@ -329,6 +339,13 @@ void render_encode_buffer(EncodeSettings &s, EncodePicture &p, const Buffer &b) 
 struct Encoder::Impl {
     int fd = -1, render_fd = -1;
     bool import = false;
+    CodecDriver driver = CodecDriver::Unknown;
+    // Linlon has no PREPEND_SPSPPS_TO_IDR / HEADER_MODE controls. Its
+    // firmware emits parameter sets once, as a separate CAPTURE buffer.
+    bool emulate_prepend = false;
+    std::vector<uint8_t> pending_header, cached_header;
+    unsigned input_planes = 1;
+    unsigned plane_sizes[2] = {};
     struct Job {
         std::shared_ptr<EncodeTask> task;
         std::shared_ptr<Buffer> output;
@@ -366,6 +383,17 @@ struct Encoder::Impl {
         trace("encoder control id=%#x value=%d", id, value);
         checked(fd, VIDIOC_S_CTRL, &ctrl, "encoder S_CTRL");
     }
+    // Returns false if the driver does not implement the control at all.
+    bool optional_control(unsigned id, int value) {
+        v4l2_queryctrl query{};
+        query.id = id;
+        if (call(fd, VIDIOC_QUERYCTRL, &query) < 0 || (query.flags & V4L2_CTRL_FLAG_DISABLED)) {
+            trace("encoder control id=%#x unsupported by driver", id);
+            return false;
+        }
+        control(id, value);
+        return true;
+    }
     void configure_deblocking() {
         const int ids[] = {settings.hevc ? V4L2_CID_MPEG_VIDEO_HEVC_LOOP_FILTER_MODE
                                          : V4L2_CID_MPEG_VIDEO_H264_LOOP_FILTER_MODE,
@@ -389,7 +417,7 @@ struct Encoder::Impl {
             // Older Iris kernels only expose firmware's enabled, 0/0 default.
             // Never silently replace a non-default request with that default.
             check((filter[0] == 0 || (settings.hevc && filter[0] == 2)) && !filter[1] && !filter[2],
-                  "deblocking request requires Iris loop-filter controls",
+                  "deblocking request requires V4L2 loop-filter controls",
                   VA_STATUS_ERROR_UNIMPLEMENTED);
             return;
         }
@@ -412,6 +440,32 @@ struct Encoder::Impl {
         QueueBuffer q(CAPTURE, index);
         q.plane.length = capture[index]->size;
         checked(fd, VIDIOC_QBUF, &q.buffer, "encoder QBUF CAPTURE");
+    }
+    // Moves one coded picture into its VA buffer, adding parameter sets the
+    // firmware delivered separately or, for Linlon, only once per stream.
+    void deliver(Buffer &output, const uint8_t *data, unsigned size, const NalPrefix &nal) {
+        const std::vector<uint8_t> *prefix = nullptr;
+        if (!pending_header.empty())
+            prefix = &pending_header;
+        else if (emulate_prepend && nal.random_access && !nal.parameters && !cached_header.empty())
+            prefix = &cached_header;
+        const size_t total = size + (prefix ? prefix->size() : 0);
+        if (total > output.data.size()) {
+            output.coded.status = VA_CODED_BUF_STATUS_SLICE_OVERFLOW_MASK;
+            throw Error(VA_STATUS_ERROR_NOT_ENOUGH_BUFFER, "coded buffer too small");
+        }
+        size_t offset = 0;
+        if (prefix) {
+            std::memcpy(output.data.data(), prefix->data(), prefix->size());
+            offset = prefix->size();
+        }
+        std::memcpy(output.data.data() + offset, data, size);
+        // Remember in-band parameter sets for later forced keyframes.
+        if (nal.parameters)
+            cached_header.assign(data, data + nal.first_slice);
+        pending_header.clear();
+        output.coded.size = unsigned(total);
+        output.coded.buf = output.data.data();
     }
     void stop(VAStatus status) noexcept {
         if (fd >= 0) {
@@ -440,7 +494,7 @@ struct Encoder::Impl {
             return;
         try {
             for (;;) {
-                QueueBuffer q(OUTPUT, 0, import);
+                QueueBuffer q(OUTPUT, 0, import, input_planes);
                 if (call(fd, VIDIOC_DQBUF, &q.buffer) < 0) {
                     check(errno == EAGAIN, "encoder DQBUF OUTPUT failed",
                           VA_STATUS_ERROR_ENCODING_ERROR);
@@ -468,21 +522,23 @@ struct Encoder::Impl {
                 check(q.plane.data_offset <= q.plane.bytesused && q.plane.bytesused <= memory->size,
                       "invalid encoder bitstream range", VA_STATUS_ERROR_ENCODING_ERROR);
                 unsigned size = q.plane.bytesused - q.plane.data_offset;
-                if (size) {
+                const uint8_t *data = memory->map() + q.plane.data_offset;
+                // A buffer of only parameter sets (Linlon codec-config output)
+                // belongs to the next picture, whatever its timestamp; never
+                // match it against a job.
+                const auto nal = scan_prefix(data, size, settings.hevc);
+                if (size && nal.parameters && !nal.slice) {
+                    pending_header.insert(pending_header.end(), data, data + size);
+                    cached_header = pending_header;
+                    trace("encoder parameter sets bytes=%u", size);
+                } else if (size) {
                     uint64_t token =
                         uint64_t(q.buffer.timestamp.tv_sec) * 1000000 + q.buffer.timestamp.tv_usec;
                     auto it = jobs.find(token);
                     check(it != jobs.end() && !it->second->frame_done, "encoder timestamp mismatch",
                           VA_STATUS_ERROR_ENCODING_ERROR);
                     auto &job = *it->second;
-                    auto &output = *job.output;
-                    if (size > output.data.size()) {
-                        output.coded.status = VA_CODED_BUF_STATUS_SLICE_OVERFLOW_MASK;
-                        throw Error(VA_STATUS_ERROR_NOT_ENOUGH_BUFFER, "coded buffer too small");
-                    }
-                    std::memcpy(output.data.data(), memory->map() + q.plane.data_offset, size);
-                    output.coded.size = size;
-                    output.coded.buf = output.data.data();
+                    deliver(*job.output, data, size, nal);
                     job.frame_done = true;
                 }
                 queue_capture(q.buffer.index);
@@ -581,13 +637,16 @@ Encoder::Encoder(const std::string &device, unsigned width, unsigned height, VAP
     e.filter = deblocking(p, s.hevc);
     e.render_fd = fcntl(render_fd, F_DUPFD_CLOEXEC, 0);
     check(e.render_fd >= 0, "duplicate encoder DRM fd");
+    // Zero-copy DMABUF input needs coherent MSM GEM (Qualcomm). Elsewhere,
+    // including Panthor on CIX Sky1, raw frames are copied into MMAP input.
     int coherent = 0;
     int probe = irisva_msm_allocate(e.render_fd, 4096, &coherent);
-    check(probe >= 0, "probe encoder shared memory", VA_STATUS_ERROR_ALLOCATION_FAILED);
-    close(probe);
-    e.import = coherent;
+    if (probe >= 0)
+        close(probe);
     e.fd = open(device.c_str(), O_RDWR | O_NONBLOCK | O_CLOEXEC);
-    check(e.fd >= 0, "open Iris encoder");
+    check(e.fd >= 0, "open V4L2 encoder");
+    e.driver = codec_driver(e.fd);
+    e.import = probe >= 0 && coherent && e.driver != CodecDriver::Mvx;
     v4l2_format fmt{};
     fmt.type = CAPTURE;
     fmt.fmt.pix_mp.width = width;
@@ -595,7 +654,8 @@ Encoder::Encoder(const std::string &device, unsigned width, unsigned height, VAP
     fmt.fmt.pix_mp.pixelformat = s.hevc ? V4L2_PIX_FMT_HEVC : V4L2_PIX_FMT_H264;
     checked(e.fd, VIDIOC_S_FMT, &fmt, "encoder S_FMT coded format");
     check(fmt.fmt.pix_mp.pixelformat == (s.hevc ? V4L2_PIX_FMT_HEVC : V4L2_PIX_FMT_H264),
-          "Iris does not support the requested encode format", VA_STATUS_ERROR_UNSUPPORTED_PROFILE);
+          "encoder does not support the requested encode format",
+          VA_STATUS_ERROR_UNSUPPORTED_PROFILE);
     fmt = {};
     fmt.type = OUTPUT;
     fmt.fmt.pix_mp.width = width;
@@ -603,8 +663,18 @@ Encoder::Encoder(const std::string &device, unsigned width, unsigned height, VAP
     fmt.fmt.pix_mp.pixelformat = V4L2_PIX_FMT_NV12;
     fmt.fmt.pix_mp.field = V4L2_FIELD_NONE;
     checked(e.fd, VIDIOC_S_FMT, &fmt, "encoder S_FMT NV12");
-    check(fmt.fmt.pix_mp.pixelformat == V4L2_PIX_FMT_NV12 && fmt.fmt.pix_mp.num_planes == 1,
-          "unsupported Iris encoder input layout");
+    {
+        const auto &input = fmt.fmt.pix_mp;
+        // Linlon describes NV12 as two discrete planes sharing one pitch.
+        check(input.pixelformat == V4L2_PIX_FMT_NV12 &&
+                  (input.num_planes == 1 ||
+                   (input.num_planes == 2 && !e.import &&
+                    input.plane_fmt[1].bytesperline == input.plane_fmt[0].bytesperline)),
+              "unsupported encoder input layout");
+        e.input_planes = input.num_planes;
+        for (unsigned i = 0; i < e.input_planes; ++i)
+            e.plane_sizes[i] = input.plane_fmt[i].sizeimage;
+    }
     e.stride = fmt.fmt.pix_mp.plane_fmt[0].bytesperline;
     e.storage_height = fmt.fmt.pix_mp.height;
     e.input_size = fmt.fmt.pix_mp.plane_fmt[0].sizeimage;
@@ -626,7 +696,7 @@ Encoder::Encoder(const std::string &device, unsigned width, unsigned height, VAP
         if (ret == 0 && !(tier.flags & V4L2_CTRL_FLAG_DISABLED))
             e.control(tier.id, s.hevc_sequence.general_tier_flag);
         else
-            check(!s.hevc_sequence.general_tier_flag, "HEVC High tier requires Iris tier control",
+            check(!s.hevc_sequence.general_tier_flag, "HEVC High tier requires a tier control",
                   VA_STATUS_ERROR_UNIMPLEMENTED);
     } else {
         e.control(V4L2_CID_MPEG_VIDEO_H264_PROFILE,
@@ -640,8 +710,17 @@ Encoder::Encoder(const std::string &device, unsigned width, unsigned height, VAP
     e.control(V4L2_CID_MPEG_VIDEO_B_FRAMES, 0);
     // Keyframes follow VA picture requests; prevent autonomous periodic IDRs.
     e.control(V4L2_CID_MPEG_VIDEO_GOP_SIZE, std::numeric_limits<int>::max());
-    e.control(V4L2_CID_MPEG_VIDEO_HEADER_MODE, V4L2_MPEG_VIDEO_HEADER_MODE_JOINED_WITH_1ST_FRAME);
-    e.control(V4L2_CID_MPEG_VIDEO_PREPEND_SPSPPS_TO_IDR, 1);
+    // Iris joins parameter sets to each IDR. Linlon implements neither control;
+    // refresh() then merges its separate parameter-set buffer into the first
+    // picture and repeats the cached sets before every later keyframe.
+    e.optional_control(V4L2_CID_MPEG_VIDEO_HEADER_MODE,
+                       V4L2_MPEG_VIDEO_HEADER_MODE_JOINED_WITH_1ST_FRAME);
+    e.emulate_prepend = !e.optional_control(V4L2_CID_MPEG_VIDEO_PREPEND_SPSPPS_TO_IDR, 1);
+    if (e.driver == CodecDriver::Mvx) {
+        // Annex B start codes ("Start codes" is menu index 1).
+        if (uint32_t nalu = find_control(e.fd, "nalu format"))
+            e.control(nalu, 1);
+    }
     e.control(V4L2_CID_MPEG_VIDEO_FRAME_RC_ENABLE, s.rate_control != VA_RC_CQP);
     if (s.rate_control != VA_RC_CQP) {
         e.control(V4L2_CID_MPEG_VIDEO_BITRATE_MODE, s.rate_control == VA_RC_CBR
@@ -653,7 +732,23 @@ Encoder::Encoder(const std::string &device, unsigned width, unsigned height, VAP
     e.control(s.hevc ? V4L2_CID_MPEG_VIDEO_HEVC_MIN_QP : V4L2_CID_MPEG_VIDEO_H264_MIN_QP, s.min_qp);
     e.control(s.hevc ? V4L2_CID_MPEG_VIDEO_HEVC_MAX_QP : V4L2_CID_MPEG_VIDEO_H264_MAX_QP, s.max_qp);
     e.configure_deblocking();
-    for (unsigned type : {CAPTURE, OUTPUT}) {
+    if (s.rate_control == VA_RC_CQP) {
+        // Configure the first picture's QP before the firmware starts: some
+        // drivers (Linlon) load the session at STREAMON with QP 0 otherwise.
+        int qp = s.hevc ? int(p.hevc_params.pic_init_qp) + p.hevc_slices.front().slice_qp_delta
+                        : int(p.params.pic_init_qp) + p.slices.front().slice_qp_delta;
+        if (qp >= 1 && qp <= 51) {
+            e.control(s.hevc ? V4L2_CID_MPEG_VIDEO_HEVC_I_FRAME_QP
+                             : V4L2_CID_MPEG_VIDEO_H264_I_FRAME_QP,
+                      qp);
+            e.control(s.hevc ? V4L2_CID_MPEG_VIDEO_HEVC_P_FRAME_QP
+                             : V4L2_CID_MPEG_VIDEO_H264_P_FRAME_QP,
+                      qp);
+            e.current_qp = qp;
+        }
+    }
+    // OUTPUT first: Linlon takes the rate from OUTPUT and only validates CAPTURE.
+    for (unsigned type : {OUTPUT, CAPTURE}) {
         v4l2_streamparm parm{};
         parm.type = type;
         parm.parm.output.timeperframe.numerator = s.fps_den;
@@ -668,11 +763,18 @@ Encoder::Encoder(const std::string &device, unsigned width, unsigned height, VAP
     fmt.fmt.pix_mp.height = height;
     fmt.fmt.pix_mp.pixelformat = s.hevc ? V4L2_PIX_FMT_HEVC : V4L2_PIX_FMT_H264;
     checked(e.fd, VIDIOC_S_FMT, &fmt, "encoder refresh CAPTURE format");
+    unsigned input_buffers = 4;
+    {
+        v4l2_control minimum{};
+        minimum.id = V4L2_CID_MIN_BUFFERS_FOR_OUTPUT;
+        if (call(e.fd, VIDIOC_G_CTRL, &minimum) == 0 && minimum.value > 0)
+            input_buffers = std::min(16u, std::max(input_buffers, unsigned(minimum.value)));
+    }
     for (unsigned type : {OUTPUT, CAPTURE}) {
         v4l2_requestbuffers req{};
         req.type = type;
         req.memory = type == OUTPUT && e.import ? V4L2_MEMORY_DMABUF : V4L2_MEMORY_MMAP;
-        req.count = 4;
+        req.count = type == OUTPUT ? input_buffers : 4;
         checked(e.fd, VIDIOC_REQBUFS, &req, "encoder REQBUFS");
         check(req.count && req.count <= 64, "invalid encoder buffer count");
         if (type == OUTPUT) {
@@ -681,26 +783,40 @@ Encoder::Encoder(const std::string &device, unsigned width, unsigned height, VAP
                 continue;
         }
         for (unsigned i = 0; i < req.count; ++i) {
-            QueueBuffer q(type, i);
+            const unsigned planes = type == OUTPUT ? e.input_planes : 1;
+            QueueBuffer q(type, i, false, planes);
             checked(e.fd, VIDIOC_QUERYBUF, &q.buffer, "encoder QUERYBUF");
+            check(q.buffer.length == planes, "unexpected encoder buffer plane count");
             auto m = std::make_shared<Memory>();
             m->origin = MemoryOrigin::Iris;
+            m->index = i;
             m->size = q.plane.length;
-            void *ptr = mmap(nullptr, m->size, PROT_READ | PROT_WRITE, MAP_SHARED, e.fd,
-                             q.plane.m.mem_offset);
-            check(ptr != MAP_FAILED, "mmap encoder buffer");
-            m->mapping = ptr;
+            if (planes == 1) {
+                void *ptr = mmap(nullptr, m->size, PROT_READ | PROT_WRITE, MAP_SHARED, e.fd,
+                                 q.plane.m.mem_offset);
+                check(ptr != MAP_FAILED, "mmap encoder buffer");
+                m->mapping = ptr;
+            }
             if (type == OUTPUT) {
                 m->stride = e.stride;
                 m->storage_height = e.storage_height;
                 m->width = e.width;
                 m->height = e.height;
-                v4l2_exportbuffer exp{};
-                exp.type = OUTPUT;
-                exp.index = i;
-                exp.flags = O_CLOEXEC | O_RDWR;
-                checked(e.fd, VIDIOC_EXPBUF, &exp, "encoder EXPBUF OUTPUT");
-                m->fd = exp.fd;
+                // Split input is mapped through its exported DMA-BUFs.
+                for (unsigned p = 0; p < planes; ++p) {
+                    v4l2_exportbuffer exp{};
+                    exp.type = OUTPUT;
+                    exp.index = i;
+                    exp.plane = p;
+                    exp.flags = O_CLOEXEC | O_RDWR;
+                    checked(e.fd, VIDIOC_EXPBUF, &exp, "encoder EXPBUF OUTPUT");
+                    if (p) {
+                        m->chroma_fd = exp.fd;
+                        m->chroma_size = q.planes[p].length;
+                    } else {
+                        m->fd = exp.fd;
+                    }
+                }
                 e.raw.push_back(m);
             } else {
                 e.capture.push_back(m);
@@ -716,9 +832,10 @@ Encoder::Encoder(const std::string &device, unsigned width, unsigned height, VAP
     type = CAPTURE;
     checked(e.fd, VIDIOC_STREAMON, &type, "encoder STREAMON CAPTURE");
     e.capture_on = true;
-    trace("encoder %s %ux%u stride=%u storage-height=%u size=%u RC=%u queue=%s", device.c_str(),
-          width, height, e.stride, e.storage_height, e.input_size, s.rate_control,
-          e.import ? "dmabuf" : "mmap");
+    trace("encoder %s %ux%u stride=%u storage-height=%u size=%u planes=%u RC=%u queue=%s "
+          "prepend=%s",
+          device.c_str(), width, height, e.stride, e.storage_height, e.input_size, e.input_planes,
+          s.rate_control, e.import ? "dmabuf" : "mmap", e.emulate_prepend ? "emulated" : "driver");
     impl_ = std::move(impl);
 }
 Encoder::~Encoder() = default;
@@ -786,7 +903,11 @@ std::shared_ptr<EncodeTask> Encoder::encode(const EncodeSettings &s, const Encod
     try {
         // Scalar V4L2 controls have no per-request association. Drain before a
         // QP change or forced IDR so they cannot affect an earlier queued frame.
-        if ((s.rate_control == VA_RC_CQP && qp != e.current_qp) || (intra && e.token))
+        // Linlon flags a forced IDR on the input buffer itself, so only Iris
+        // (FORCE_KEY_FRAME control) needs a drain for keyframe requests.
+        const bool keyframe_control = e.driver != CodecDriver::Mvx;
+        if ((s.rate_control == VA_RC_CQP && qp != e.current_qp) ||
+            (intra && e.token && keyframe_control))
             e.finish();
         if (e.jobs.size() == e.input_count + e.capture.size()) {
             auto task = e.jobs.begin()->second->task;
@@ -857,13 +978,23 @@ std::shared_ptr<EncodeTask> Encoder::encode(const EncodeSettings &s, const Encod
                       qp);
             e.current_qp = qp;
         }
-        if (intra && e.token)
+        if (intra && e.token && keyframe_control)
             e.control(V4L2_CID_MPEG_VIDEO_FORCE_KEY_FRAME, 0);
-        QueueBuffer q(OUTPUT, index, e.import);
+        QueueBuffer q(OUTPUT, index, e.import, e.input_planes);
         if (e.import)
             q.plane.m.fd = memory->fd;
-        q.plane.length = memory->size;
-        q.plane.bytesused = e.input_size;
+        if (e.input_planes == 1) {
+            q.plane.length = memory->size;
+            q.plane.bytesused = e.input_size;
+        } else {
+            for (unsigned p = 0; p < e.input_planes; ++p) {
+                q.planes[p].length = p ? memory->chroma_size : memory->size;
+                q.planes[p].bytesused = e.plane_sizes[p];
+            }
+        }
+        // Linlon: KEYFRAME on a raw input buffer requests an IDR for it.
+        if (intra && e.token && !keyframe_control)
+            q.buffer.flags |= V4L2_BUF_FLAG_KEYFRAME;
         const uint64_t token = e.token + 1;
         q.buffer.timestamp.tv_sec = token / 1000000;
         q.buffer.timestamp.tv_usec = token % 1000000;

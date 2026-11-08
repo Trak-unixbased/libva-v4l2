@@ -13,8 +13,7 @@ Buffer::~Buffer() {
         --parent->acquired_handles;
     }
     if (mapped) {
-        dma_buf_sync sync{DMA_BUF_SYNC_END | DMA_BUF_SYNC_RW};
-        ioctl(memory->fd, DMA_BUF_IOCTL_SYNC, &sync);
+        memory->sync(DMA_BUF_SYNC_END | DMA_BUF_SYNC_RW);
         --parent->mapped_images;
     }
     if (memory)
@@ -31,8 +30,7 @@ uint8_t *Buffer::map() {
     check(!parent->acquired_handles, "surface handle acquired", VA_STATUS_ERROR_SURFACE_BUSY);
     auto pointer = memory->map();
     if (!mapped) {
-        dma_buf_sync sync{DMA_BUF_SYNC_START | DMA_BUF_SYNC_RW};
-        check(ioctl(memory->fd, DMA_BUF_IOCTL_SYNC, &sync) == 0,
+        check(memory->sync(DMA_BUF_SYNC_START | DMA_BUF_SYNC_RW),
               "DMA-BUF map synchronization failed");
         mapped = true;
         ++parent->mapped_images;
@@ -43,9 +41,7 @@ void Buffer::unmap() {
     coded_mapped = false;
     if (!mapped)
         return;
-    dma_buf_sync sync{DMA_BUF_SYNC_END | DMA_BUF_SYNC_RW};
-    check(ioctl(memory->fd, DMA_BUF_IOCTL_SYNC, &sync) == 0,
-          "DMA-BUF unmap synchronization failed");
+    check(memory->sync(DMA_BUF_SYNC_END | DMA_BUF_SYNC_RW), "DMA-BUF unmap synchronization failed");
     mapped = false;
     --parent->mapped_images;
 }
@@ -231,32 +227,18 @@ static VAImage create_image(Driver &d, unsigned fourcc, unsigned w, unsigned h) 
     return image;
 }
 
-static std::shared_ptr<Memory> allocate_undecoded_surface(VADriverContextP ctx, const Surface &s) {
+static std::shared_ptr<Memory> allocate_undecoded_surface(VADriverContextP ctx, Driver &d,
+                                                          const Surface &s) {
     // mpv probes GPU import before creating a decoder context. Use an actual
-    // linear MSM GEM allocation for these otherwise unbacked VA surfaces.
-    // The PRIME fd owns the storage after the temporary GEM handle is closed.
+    // linear allocation for these otherwise unbacked VA surfaces: MSM GEM on
+    // Qualcomm, otherwise DMA heap, udmabuf or GBM (Panthor on CIX Sky1).
+    // The PRIME fd owns the storage after any temporary GEM handle is closed.
     // If exported before decode, keep this allocation for the surface's
     // lifetime. A consumer may keep its fd without calling export again.
     check(ctx->drm_state, "surface allocation requires a DRM display");
-    int fd = static_cast<drm_state *>(ctx->drm_state)->fd;
-    auto m = std::make_shared<Memory>();
-    m->width = s.width;
-    m->height = s.height;
-    m->fourcc = s.fourcc;
-    unsigned bytes_per_sample = s.fourcc == VA_FOURCC_P010 ? 2 : 1;
-    m->stride = (s.width * bytes_per_sample + 127) & ~127u;
-    m->storage_height = (s.height + 31) & ~31u;
-    long page_size = sysconf(_SC_PAGESIZE);
-    check(page_size > 0, "cannot determine page size");
-    size_t size = size_t(m->stride) * m->storage_height * 3 / 2;
-    m->size = (size + size_t(page_size) - 1) / size_t(page_size) * size_t(page_size);
-    int coherent = 0;
-    m->fd = irisva_msm_allocate(fd, m->size, &coherent);
-    m->origin = coherent ? MemoryOrigin::MsmCoherent : MemoryOrigin::MsmWriteCombined;
-    check(m->fd >= 0, "allocate/export undecoded MSM surface", VA_STATUS_ERROR_ALLOCATION_FAILED);
-    trace("allocated undecoded surface %ux%u fourcc=%#x pitch=%u size=%zu coherent=%d", s.width,
-          s.height, s.fourcc, m->stride, m->size, coherent);
-    return m;
+    if (!d.allocator)
+        d.allocator = std::make_unique<Allocator>(static_cast<drm_state *>(ctx->drm_state)->fd);
+    return d.allocator->allocate(s.width, s.height, s.fourcc);
 }
 
 API(query_profiles, (VADriverContextP ctx, VAProfile *out, int *count), (void)d;
@@ -798,15 +780,14 @@ API(
     check(image, "null derived image", VA_STATUS_ERROR_INVALID_PARAMETER);
     auto s = surface(d, id); synchronize(d, s);
     check(!s->acquired_handles, "surface handle acquired", VA_STATUS_ERROR_SURFACE_BUSY);
-    if (!s->memory) s->memory = allocate_undecoded_surface(ctx, *s); auto m = s->memory;
+    if (!s->memory) s->memory = allocate_undecoded_surface(ctx, d, *s); auto m = s->memory;
     VAImage result{}; result.image_id = d.next_id++; result.buf = d.next_id++;
     result.format = image_format(m->fourcc); result.width = s->width; result.height = s->height;
-    result.data_size = m->size; result.num_planes = 2;
+    result.data_size = m->mapping_size(); result.num_planes = 2;
     result.pitches[0] = result.pitches[1] = m->stride; result.offsets[0] = m->data_offset;
-    result.offsets[1] = m->data_offset + m->stride * m->storage_height;
-    auto b = std::make_shared<Buffer>(); b->type = VAImageBufferType;
-    b->element_size = result.data_size; b->elements = 1; b->parent = s; b->memory = m;
-    ++s->derived_images; d.buffers[result.buf] = b;
+    result.offsets[1] = m->chroma_mapping_offset(); auto b = std::make_shared<Buffer>();
+    b->type = VAImageBufferType; b->element_size = result.data_size; b->elements = 1; b->parent = s;
+    b->memory = m; ++s->derived_images; d.buffers[result.buf] = b;
     try { d.images[result.image_id] = result; } catch (...) {
         d.buffers.erase(result.buf);
         throw;
@@ -828,7 +809,7 @@ API(
           VA_STATUS_ERROR_SURFACE_BUSY);
     check((s->fourcc == VA_FOURCC_P010) == (image.format.fourcc == VA_FOURCC_P010),
           "image bit depth conversion unsupported", VA_STATUS_ERROR_INVALID_IMAGE_FORMAT);
-    if (!s->memory) s->memory = allocate_undecoded_surface(ctx, *s); auto m = s->memory;
+    if (!s->memory) s->memory = allocate_undecoded_surface(ctx, d, *s); auto m = s->memory;
     auto source_buffer = buffer(d, image.buf); ImageMapping source(source_buffer);
     auto destination_buffer = std::make_shared<Buffer>(); destination_buffer->parent = s;
     destination_buffer->memory = m; ++s->derived_images;
@@ -838,8 +819,8 @@ API(
                     source.data + image.offsets[0] + (sy + row) * image.pitches[0] + sx * bytes,
                     sw *bytes);
     for (unsigned row = 0; row < sh / 2; ++row) {
-        auto uv = destination.data + m->data_offset +
-                  (m->storage_height + dy / 2 + row) * m->stride + dx * bytes;
+        auto uv = destination.data + m->chroma_mapping_offset() + size_t(dy / 2 + row) * m->stride +
+                  dx * bytes;
         if (image.format.fourcc == VA_FOURCC_I420) {
             for (unsigned col = 0; col < sw / 2; ++col) {
                 uv[2 * col] =
@@ -861,6 +842,9 @@ API(acquire_buffer_handle, (VADriverContextP ctx, VABufferID id, VABufferInfo *i
     auto b = buffer(d, id);
     check(bool(b->memory), "only derived image buffers have DMA-BUF handles",
           VA_STATUS_ERROR_UNSUPPORTED_BUFFERTYPE);
+    // VABufferInfo carries one handle; use vaExportSurfaceHandle instead.
+    check(!b->memory->split(), "two-object surfaces have no single buffer handle",
+          VA_STATUS_ERROR_UNSUPPORTED_MEMORY_TYPE);
     check(!info->mem_type || (info->mem_type & VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME),
           "buffer handle requires DRM PRIME", VA_STATUS_ERROR_UNSUPPORTED_MEMORY_TYPE);
     synchronize(d, b->parent); check(!b->parent->acquired_handles && !b->parent->mapped_images,
@@ -900,12 +884,12 @@ API(
     check(uint64_t(x) + w <= m->width && uint64_t(y) + h <= m->height,
           "image exceeds CAPTURE layout");
     uint8_t *base = m->map() + m->data_offset;
-    dma_buf_sync sync{DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ};
-    check(ioctl(m->fd, DMA_BUF_IOCTL_SYNC, &sync) == 0, "DMA-BUF read synchronization failed");
+    check(m->sync(DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ), "DMA-BUF read synchronization failed");
     for (unsigned row = 0; row < h; ++row)
         std::memcpy(destination.data + image.offsets[0] + row * image.pitches[0],
                     base + (y + row) * m->stride + x * bytes_per_sample, w *bytes_per_sample);
-    uint8_t *uv = base + m->stride * m->storage_height + (y / 2) * m->stride + x * bytes_per_sample;
+    uint8_t *uv = m->map() + m->chroma_mapping_offset() + size_t(y / 2) * m->stride +
+                  x * bytes_per_sample;
     for (unsigned row = 0; row < (h + 1) / 2; ++row) {
         if (image.format.fourcc != VA_FOURCC_I420)
             std::memcpy(destination.data + image.offsets[1] + row * image.pitches[1],
@@ -917,8 +901,8 @@ API(
                 destination.data[image.offsets[2] + row * image.pitches[2] + col] =
                     uv[row * m->stride + 2 * col + 1];
             }
-    } sync.flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ;
-    check(ioctl(m->fd, DMA_BUF_IOCTL_SYNC, &sync) == 0, "DMA-BUF read synchronization end failed");
+    } check(m->sync(DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ),
+            "DMA-BUF read synchronization end failed");
     destination.finish(); return VA_STATUS_SUCCESS;)
 API(
     export_surface,
@@ -928,25 +912,32 @@ API(
           VA_STATUS_ERROR_UNSUPPORTED_MEMORY_TYPE);
     auto s = surface(d, id); synchronize(d, s);
     // GPU producers such as Sunshine render into exported encoder input.
-    // Independent storage is writable: Iris CAPTURE allocations
+    // Independent storage is writable: decoder CAPTURE allocations
     // may still be decoder references and have cached CPU aliases.
     check(!(flags & VA_EXPORT_SURFACE_WRITE_ONLY) || !s->memory ||
-              s->memory->origin == MemoryOrigin::MsmCoherent ||
-              s->memory->origin == MemoryOrigin::MsmWriteCombined ||
-              s->memory->origin == MemoryOrigin::DmaHeap ||
-              s->memory->origin == MemoryOrigin::Imported,
+              independent_storage(s->memory->origin),
           "writable export requires independent storage", VA_STATUS_ERROR_UNIMPLEMENTED);
-    if (!s->memory) s->memory = allocate_undecoded_surface(ctx, *s); auto m = s->memory;
+    if (!s->memory) s->memory = allocate_undecoded_surface(ctx, d, *s); auto m = s->memory;
     auto &desc = *static_cast<VADRMPRIMESurfaceDescriptor *>(out); desc = {};
-    desc.fourcc = m->fourcc; desc.width = s->width; desc.height = s->height; desc.num_objects = 1;
-    desc.objects[0].fd = fcntl(m->fd, F_DUPFD_CLOEXEC, 0);
-    check(desc.objects[0].fd >= 0, "duplicate DMA-BUF fd"); if (!s->token) {
+    desc.fourcc = m->fourcc; desc.width = s->width; desc.height = s->height;
+    // Linlon CAPTURE planes are separate DMA-BUFs: describe them as two
+    // objects. All other storage carries both planes in one object.
+    desc.num_objects = m->split() ? 2 : 1;
+    for (unsigned i = 0; i < desc.num_objects; ++i) {
+        desc.objects[i].fd = fcntl(i ? m->chroma_fd : m->fd, F_DUPFD_CLOEXEC, 0);
+        if (desc.objects[i].fd < 0) {
+            for (unsigned j = 0; j < i; ++j)
+                close(desc.objects[j].fd);
+            throw Error(VA_STATUS_ERROR_OPERATION_FAILED, "duplicate DMA-BUF fd");
+        }
+        desc.objects[i].size = i ? m->chroma_size : m->size;
+        desc.objects[i].drm_format_modifier = DRM_FORMAT_MOD_LINEAR;
+    } if (!s->token) {
         if (!s->persistent_export)
             trace("surface=%#x persistent GEM export (copy if later decoded)", id);
         s->persistent_export = true;
-    } desc.objects[0]
-                                                                .size = m->size;
-    desc.objects[0].drm_format_modifier = DRM_FORMAT_MOD_LINEAR;
+    } const uint32_t chroma_object = m->split() ? 1 : 0;
+    const auto chroma_offset = uint32_t(m->chroma_object_offset());
     if (!(flags & VA_EXPORT_SURFACE_COMPOSED_LAYERS)) {
         desc.num_layers = 2;
         desc.layers[0].drm_format = m->fourcc == VA_FOURCC_P010 ? DRM_FORMAT_R16 : DRM_FORMAT_R8;
@@ -954,16 +945,19 @@ API(
             m->fourcc == VA_FOURCC_P010 ? DRM_FORMAT_GR1616 : DRM_FORMAT_GR88;
         for (unsigned i = 0; i < 2; ++i) {
             desc.layers[i].num_planes = 1;
+            desc.layers[i].object_index[0] = i ? chroma_object : 0;
             desc.layers[i].pitch[0] = m->stride;
-            desc.layers[i].offset[0] = m->data_offset + (i ? m->stride * m->storage_height : 0);
+            desc.layers[i].offset[0] = i ? chroma_offset : m->data_offset;
         }
     } else {
         desc.num_layers = 1;
         desc.layers[0].drm_format = m->fourcc == VA_FOURCC_P010 ? DRM_FORMAT_P010 : DRM_FORMAT_NV12;
         desc.layers[0].num_planes = 2;
+        desc.layers[0].object_index[0] = 0;
+        desc.layers[0].object_index[1] = chroma_object;
         desc.layers[0].pitch[0] = desc.layers[0].pitch[1] = m->stride;
         desc.layers[0].offset[0] = m->data_offset;
-        desc.layers[0].offset[1] = m->data_offset + m->stride * m->storage_height;
+        desc.layers[0].offset[1] = chroma_offset;
     } return VA_STATUS_SUCCESS;)
 
 API(query_vpp_filters,
@@ -1010,7 +1004,7 @@ extern "C" VAStatus __vaDriverInit_1_0(VADriverContextP ctx) {
         ctx->max_image_formats = 3;
         ctx->max_subpic_formats = 1;
         ctx->max_display_attributes = 1;
-        ctx->str_vendor = "Iris V4L2 stateful VA-API backend";
+        ctx->str_vendor = "V4L2 stateful VA-API backend (Qualcomm Iris, Arm Linlon)";
         auto &v = *ctx->vtable;
         if (ctx->vtable_vpp && vpp_supported(VAProfileNone, VAEntrypointVideoProc)) {
             auto &vpp = *ctx->vtable_vpp;

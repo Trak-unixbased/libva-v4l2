@@ -1,0 +1,10 @@
+Package: libva-v4l2-cix8180
+Version: 1.0.0-20261108
+Architecture: arm64
+Maintainer: Trak.unixbased <trak.unixbased@gmail.com>
+Depends: libva2, libdrm2
+Section: video
+Priority: optional
+Description: Backend libva-v4l2 optimisé pour SoC CIX CD8180 (Orange Pi 6 Plus)
+ Ce paquet contient le pilote V4L2 pour l'accélération matérielle VA-API.
+ Compilé avec LTO et optimisations ARMv8.2-A pour Ubuntu 26.04 LTS aarch64.

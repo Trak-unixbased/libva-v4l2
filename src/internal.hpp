@@ -21,9 +21,11 @@
 #include <cstdio>
 #include <cstdlib>
 #include <atomic>
+#include <cstddef>
 #include <type_traits>
 
 extern "C" int irisva_msm_allocate(int drm_fd, uint64_t size, int *coherent);
+extern "C" int irisva_drm_is_msm(int drm_fd);
 
 namespace irisva {
 struct Error : std::runtime_error {
@@ -44,18 +46,78 @@ template <class... A> void trace(const char *f, A... a) {
         std::fprintf(stderr, "\n");
     }
 }
-enum class MemoryOrigin { Unknown, MsmWriteCombined, MsmCoherent, DmaHeap, Imported, Iris };
+// Iris: storage owned by the V4L2 codec driver (Iris or Arm Linlon "mvx").
+// Such buffers may still be decoder references and are never written by VA.
+enum class MemoryOrigin {
+    Unknown,
+    MsmWriteCombined,
+    MsmCoherent,
+    DmaHeap,
+    Imported,
+    Iris,
+    Udmabuf,
+    Gbm
+};
+inline bool independent_storage(MemoryOrigin origin) {
+    return origin == MemoryOrigin::MsmCoherent || origin == MemoryOrigin::MsmWriteCombined ||
+           origin == MemoryOrigin::DmaHeap || origin == MemoryOrigin::Imported ||
+           origin == MemoryOrigin::Udmabuf || origin == MemoryOrigin::Gbm;
+}
+// A semi-planar NV12/P010 picture. The luma plane starts at data_offset in
+// fd. The chroma plane either follows in the same object, at
+// data_offset + stride * storage_height (Iris, VA allocations), or lives in
+// a second DMA-BUF (chroma_fd, chroma_offset): Arm Linlon reports NV12/P010
+// as two discrete V4L2 planes. Both planes always share one stride.
 struct Memory {
     std::shared_ptr<void> fastcv_registration;
     MemoryOrigin origin = MemoryOrigin::Unknown;
     int fd = -1;
     void *mapping = nullptr;
     size_t size = 0;
+    int chroma_fd = -1;
+    size_t chroma_size = 0;
+    unsigned chroma_offset = 0;
     unsigned index = 0, stride = 0, storage_height = 0, width = 0, height = 0;
     unsigned data_offset = 0, fourcc = VA_FOURCC_NV12;
     bool queued = false;
     ~Memory();
+    bool split() const {
+        return chroma_fd >= 0;
+    }
+    // CPU mapping of both planes. Split buffers are mapped back to back,
+    // the chroma object starting at the page-aligned end of the luma object.
     uint8_t *map();
+    size_t mapping_size() const;
+    // Chroma plane offset inside map().
+    size_t chroma_mapping_offset() const;
+    // DMA-BUF and offset holding the chroma plane.
+    int chroma_object_fd() const {
+        return split() ? chroma_fd : fd;
+    }
+    uint64_t chroma_object_offset() const {
+        return split() ? uint64_t(chroma_offset)
+                       : uint64_t(data_offset) + uint64_t(stride) * storage_height;
+    }
+    size_t chroma_object_size() const {
+        return split() ? chroma_size : size;
+    }
+    // DMA_BUF_IOCTL_SYNC on every object; returns false on failure.
+    bool sync(uint64_t flags) const;
+};
+// Linear, CPU-mappable storage for surfaces that are not decoder output.
+// Allocation order: MSM GEM (Qualcomm), the system DMA heap, udmabuf, then
+// a linear GBM buffer on the VA render node (Panthor and other Mesa GPUs).
+class Allocator {
+    struct Gbm;
+    int render_fd_;
+    bool msm_;
+    std::unique_ptr<Gbm> gbm_;
+    bool gbm_failed_ = false;
+
+  public:
+    explicit Allocator(int render_fd);
+    ~Allocator();
+    std::shared_ptr<Memory> allocate(unsigned width, unsigned height, unsigned fourcc);
 };
 class Decoder;
 class SurfaceCopier {
@@ -162,18 +224,32 @@ std::vector<uint8_t> h264_bitstream(VAProfile profile, const Picture &picture, H
 std::vector<uint8_t> hevc_bitstream(VAProfile profile, const HevcPicture &picture,
                                     HevcState &state);
 
+enum class CodecDriver { Unknown, Iris, Mvx };
+// V4L2 QUERYCAP driver name of an open video node.
+CodecDriver codec_driver(int fd);
+// Finds a stateful M2M node: H.264 on OUTPUT (decoder) or CAPTURE (encoder).
+// The first environment variable which is set overrides discovery.
+std::string find_codec_device(bool encoder, const char *const *environment);
+// Finds a V4L2 control by its driver-specific name; 0 if absent.
+uint32_t find_control(int fd, const char *name);
+
 class Decoder {
     int fd_ = -1;
     FILE *dump_ = nullptr;
     std::mutex mutex_;
+    CodecDriver driver_ = CodecDriver::Unknown;
     bool output_on_ = false, capture_on_ = false;
     bool source_change_ = false, last_ = false;
+    unsigned capture_planes_ = 1, capture_bytesperline_ = 0;
     unsigned width_, height_, pool_size_, fourcc_;
     uint64_t next_token_ = 1;
     std::vector<std::shared_ptr<Memory>> output_, capture_;
     std::map<uint64_t, std::shared_ptr<Surface>> pending_;
     SurfaceCopier copier_;
-    void allocate(unsigned type, unsigned count, std::vector<std::shared_ptr<Memory>> &pool);
+    void allocate(unsigned type, unsigned count, unsigned planes,
+                  std::vector<std::shared_ptr<Memory>> &pool);
+    void configure_decode_order(VAProfile profile);
+    bool capture_format_unchanged();
     void configure_capture();
     void pump(int timeout_ms);
     void requeue();
@@ -270,6 +346,7 @@ struct Driver {
     std::recursive_mutex mutex;
     std::string device;
     std::string encoder_device;
+    std::unique_ptr<Allocator> allocator;
     uint32_t next_id = 1;
     std::map<uint32_t, Config> configs;
     std::map<uint32_t, std::shared_ptr<Context>> contexts;

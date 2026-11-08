@@ -48,6 +48,7 @@ endif
 summary('FastCV CDSP VPP', have_fastcv)
 
 sources = files(
+  'src/allocator.cpp',
   'src/backend.cpp',
   'src/decoder.cpp',
   'src/encoder.cpp',
@@ -71,13 +72,16 @@ shared_library(
   install_dir: driver_install_dir,
 )
 
-# libva falls back to the DRM driver name on Qualcomm MSM devices.
-install_symlink(
-  'msm_drv_video.so',
-  pointing_to: 'v4l2_drv_video.so',
-  install_dir: driver_install_dir,
-  install_tag: 'runtime',
-)
+# libva falls back to the DRM driver name of the VA display: msm on Qualcomm,
+# panthor for the Mali-G720 render node of CIX Sky1 (Orange Pi 6 Plus).
+foreach alias : ['msm', 'panthor']
+  install_symlink(
+    alias + '_drv_video.so',
+    pointing_to: 'v4l2_drv_video.so',
+    install_dir: driver_install_dir,
+    install_tag: 'runtime',
+  )
+endforeach
 
 install_data('README.md', install_dir: get_option('datadir') / 'doc' / meson.project_name())
 install_data('LICENSE', install_dir: get_option('datadir') / 'licenses' / meson.project_name())

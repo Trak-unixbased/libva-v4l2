@@ -6,9 +6,9 @@
 #include <cerrno>
 
 namespace irisva {
-void wait_surface_access(const Memory &memory, short events) {
-    auto start = std::chrono::steady_clock::now();
-    pollfd fence{memory.fd, events, 0};
+namespace {
+void wait_object(int fd, short events, std::chrono::steady_clock::time_point start) {
+    pollfd fence{fd, events, 0};
     for (;;) {
         int result = poll(&fence, 1, 100);
         if (result < 0 && errno == EINTR)
@@ -21,15 +21,14 @@ void wait_surface_access(const Memory &memory, short events) {
               "persistent surface DMA-BUF fence timeout", VA_STATUS_ERROR_TIMEDOUT);
     }
 }
-namespace {
-int sync_ioctl(int fd, uint64_t flags) {
-    dma_buf_sync sync{flags};
-    int result;
-    do {
-        result = ioctl(fd, DMA_BUF_IOCTL_SYNC, &sync);
-    } while (result < 0 && errno == EINTR);
-    return result;
+} // namespace
+void wait_surface_access(const Memory &memory, short events) {
+    auto start = std::chrono::steady_clock::now();
+    wait_object(memory.fd, events, start);
+    if (memory.split())
+        wait_object(memory.chroma_fd, events, start);
 }
+namespace {
 struct CpuAccess {
     Memory &memory;
     uint64_t access;
@@ -38,29 +37,29 @@ struct CpuAccess {
         // DMA_BUF_IOCTL_SYNC maintains CPU cache coherency, not exclusion
         // against an outstanding GPU reader of a recycled exported surface.
         wait_surface_access(memory, flags & DMA_BUF_SYNC_WRITE ? POLLOUT : POLLIN);
-        check(sync_ioctl(memory.fd, DMA_BUF_SYNC_START | access) == 0,
-              "persistent surface DMA-BUF access failed");
+        check(memory.sync(DMA_BUF_SYNC_START | access), "persistent surface DMA-BUF access failed");
         active = true;
     }
     void finish() {
         if (!active)
             return;
-        check(sync_ioctl(memory.fd, DMA_BUF_SYNC_END | access) == 0,
-              "persistent surface DMA-BUF access end failed");
         active = false;
+        check(memory.sync(DMA_BUF_SYNC_END | access),
+              "persistent surface DMA-BUF access end failed");
     }
     ~CpuAccess() {
         if (active)
-            sync_ioctl(memory.fd, DMA_BUF_SYNC_END | access);
+            memory.sync(DMA_BUF_SYNC_END | access);
     }
 };
 void validate(const Memory &m, unsigned width, unsigned height, unsigned bytes) {
-    const uint64_t chroma_offset = uint64_t(m.data_offset) + uint64_t(m.stride) * m.storage_height;
     const uint64_t chroma_rows = (height + 1) / 2;
     const uint64_t row_bytes = uint64_t((width + 1) & ~1u) * bytes;
     check(width && height && width <= m.width && height <= m.height && height <= m.storage_height &&
               row_bytes <= m.stride &&
-              chroma_offset + (chroma_rows - 1) * m.stride + row_bytes <= m.size,
+              uint64_t(m.data_offset) + uint64_t(height - 1) * m.stride + row_bytes <= m.size &&
+              m.chroma_object_offset() + (chroma_rows - 1) * m.stride + row_bytes <=
+                  m.chroma_object_size(),
           "persistent surface copy exceeds buffer layout", VA_STATUS_ERROR_INVALID_SURFACE);
 }
 } // namespace
@@ -77,12 +76,16 @@ void copy_surface(Memory &destination, Memory &source, unsigned width, unsigned 
     CpuAccess read(source, DMA_BUF_SYNC_READ);
     CpuAccess write(destination, DMA_BUF_SYNC_WRITE);
     for (unsigned plane = 0; plane < 2; ++plane) {
-        size_t src_offset =
-            source.data_offset + (plane ? size_t(source.stride) * source.storage_height : 0);
-        size_t dst_offset = destination.data_offset +
-                            (plane ? size_t(destination.stride) * destination.storage_height : 0);
+        size_t src_offset = plane ? source.chroma_mapping_offset() : source.data_offset;
+        size_t dst_offset = plane ? destination.chroma_mapping_offset() : destination.data_offset;
         unsigned rows = plane ? (height + 1) / 2 : height;
         unsigned row_bytes = (plane ? ((width + 1) & ~1u) : width) * bytes;
+        if (source.stride == destination.stride && row_bytes + 128 >= source.stride) {
+            // Identical pitches: one large copy is faster than per-row calls.
+            std::memcpy(dst + dst_offset, src + src_offset,
+                        size_t(rows - 1) * source.stride + row_bytes);
+            continue;
+        }
         for (unsigned row = 0; row < rows; ++row)
             std::memcpy(dst + dst_offset + size_t(row) * destination.stride,
                         src + src_offset + size_t(row) * source.stride, row_bytes);

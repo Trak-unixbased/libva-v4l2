@@ -1,9 +1,14 @@
 # libva-v4l2
 
-A VA-API backend for Qualcomm Iris, using the Linux V4L2 stateful M2M interface.
-It provides hardware video decoding and H.264/HEVC encoding on **SC8280XP**, tested on
-**Radxa Dragon Q8B**. The project is experimental and targets this platform;
-it is not a generic backend for all V4L2 devices.
+A VA-API backend for V4L2 stateful M2M codecs. It provides hardware video decoding and
+H.264/HEVC encoding on:
+
+- **Qualcomm SC8280XP** (Iris), tested on **Radxa Dragon Q8B**;
+- **CIX CD8180 / Sky1** (Arm Linlon MVE v8, V4L2 driver `mvx`, Mali-G720 through
+  Panthor), targeting **Orange Pi 6 Plus** with Ubuntu 26.04 and a Sky1 Linux 7.x kernel.
+
+The project is experimental and targets these platforms; it is not a generic backend for
+all V4L2 devices.
 
 ## Support
 
@@ -50,11 +55,14 @@ and pipeline configuration.
 
 ## Requirements
 
-- Linux with the Qualcomm Iris stateful driver and MSM DRM support.
-- The changes supplied in [patches/](patches/), unless already present in your
-  kernel: decode-order output, larger CAPTURE pools, and encoder deblocking
-  controls. The patches are references to integrate into your kernel.
-- Access to the Iris video devices and DRM render node.
+- Qualcomm: Linux with the Iris stateful driver and MSM DRM support, plus the changes
+  supplied in [patches/](patches/), unless already present in your kernel: decode-order
+  output, larger CAPTURE pools, and encoder deblocking controls. The patches are
+  references to integrate into your kernel.
+- CIX Sky1 (Orange Pi 6 Plus): a kernel with the Sky1 patches (Panthor GPU support),
+  the Linlon VPU module (`amvx`, e.g. from `sky1-drivers-dkms`) with its firmware, and
+  Mesa ≥ 25.1 (Panfrost/Panthor). No kernel patch from [patches/](patches/) is needed.
+- Access to the video devices and the DRM render node (`video` and `render` groups).
 - A C++17 compiler, Meson ≥ 0.61, Ninja, pkg-config, and development libraries
   for libva, libdrm, EGL, GLES 3.2, and GBM.
 - For VPP: system FastCV and FastRPC libraries with a working CDSP runtime.
@@ -92,9 +100,10 @@ when dependencies are available or `-Dfastcv=enabled` to require build dependenc
 Debian / Ubuntu packages explicitly disable FastCV for consistent distribution builds.
 FastCV is loaded dynamically; missing runtime libraries disable only VPP.
 
-Adjust `libdir` if your system uses a driver directory other than `/usr/lib/dri`.
-Installation adds the MSM driver alias, so **`LIBVA_DRIVER_NAME` is not required**
-on the target platform.
+Adjust `libdir` if your system uses a driver directory other than `/usr/lib/dri`
+(Debian/Ubuntu on ARM64: `-Dlibdir=lib/aarch64-linux-gnu`).
+Installation adds the `msm` and `panthor` driver aliases, so **`LIBVA_DRIVER_NAME` is not
+required** on the target platforms.
 
 To check the installation (`vainfo` comes from `libva-utils` on Arch):
 
@@ -161,9 +170,34 @@ while H.264 remains available.
 | --- | --- |
 | `LIBVA_DRIVER_NAME=v4l2` | Explicitly select this backend. |
 | `LIBVA_DRIVERS_PATH=/path/to/build` | Load an uninstalled build. |
-| `IRIS_VAAPI_DEVICE` / `IRIS_VAAPI_ENCODER_DEVICE` | Override automatic video-device discovery. |
+| `LIBVA_V4L2_DECODER_DEVICE` / `LIBVA_V4L2_ENCODER_DEVICE` | Override automatic video-device discovery (also `IRIS_VAAPI_DEVICE` / `IRIS_VAAPI_ENCODER_DEVICE`). |
 | `IRIS_VAAPI_COPY=gpu` or `cpu` | Select the copy path; default is `gpu`. |
 | `IRIS_VAAPI_DEBUG=1` | Enable diagnostics. |
+
+### CIX Sky1 / Orange Pi 6 Plus notes
+
+- Discovery uses the Linlon nodes named `mvxdec` / `mvxenc` and does not open other video
+  nodes (the vendor ISP node is known to misbehave when probed).
+- Decoding requests decode-order output through the Linlon `frame reordering` control and
+  marks each compressed frame as complete, so every VA picture finishes on its own.
+- Linlon reports NV12/P010 as two V4L2 planes. Decoded surfaces are exported as two-object
+  DRM PRIME descriptors with 128-byte pitches; `vaDeriveImage` maps both planes into one
+  range. `vaAcquireBufferHandle` is unavailable for these surfaces.
+- Surfaces which are not decoder output are allocated from `/dev/dma_heap/system` when
+  accessible, then `/dev/udmabuf`, then a linear GBM buffer on the Panthor render node.
+- The GPU copy uses GLES 3.1 (Panfrost) with `EXT_copy_image` or a framebuffer blit.
+- Encoding copies NV12 input into the VPU queue on the CPU. Parameter sets, which the
+  Linlon firmware emits once as a separate buffer, are merged into the first picture and
+  repeated before every forced keyframe. B frames remain unsupported.
+
+Quick check on the board:
+
+```sh
+v4l2-ctl --list-devices          # expect mvxdec and mvxenc
+vainfo --display drm --device /dev/dri/renderD128
+IRIS_VAAPI_DEBUG=1 ffmpeg -hwaccel vaapi -hwaccel_device /dev/dri/renderD128 \
+  -i input.mp4 -f null -
+```
 
 Use clang-format 22 and the checked-in `.clang-format`. Meson provides `format`
 and `format-check` targets when clang-format is available; `-Dwerror=true`
